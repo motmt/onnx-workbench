@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 运行时数据（用户上传/导出产物，不入库）
+uploads/
+exports/
+
+# WorkBuddy 工作区记忆（私人）
+.workbuddy/
+
+# 日志
+*.log
+server.log
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 样例模型保留（sample_models/ 入库，供试用）
+# 但排除大模型
+sample_models/*.onnx
+!sample_models/sample_mlp.onnx

@@ -1,0 +1,7 @@
+# TFLite / NPU 导出可选依赖（体积较大，按需安装）
+# 安装：pip install -r requirements-tflite.txt
+# 注意：tf_keras 用 --no-deps 安装可避免依赖解析卡顿
+
+onnx2tf==2.6.8
+tensorflow-cpu==2.21.0
+tf_keras  # pip install tf_keras --no-deps
