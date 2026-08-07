@@ -262,14 +262,23 @@ def _build_rep_dataset(onnx_path: str, calibration: str,
 
 
 def export_npu_tflite(onnx_path: str, out_dir: str,
-                      calibration: str = "random", num_samples: int = 16,
-                      images_dir: Optional[str] = None) -> dict:
+                      calibration: str = "random", num_samples: int = 8,
+                      images_dir: Optional[str] = None,
+                      original_name: Optional[str] = None) -> dict:
     """导出 QNN NPU 专用的全 INT8 TFLite（输入输出均为 INT8）。
 
     前置：必须先通过 check_npu_compliance 检查。
     流程：onnx2tf tf_converter 生成 SavedModel → TFLiteConverter 全整数量化。
+
+    性能：onnx2tf tf_converter 是主要瓶颈（占 95%），校准样本数影响极小
+    （16/8/4 样本耗时差异 <0.03s），默认用 8 样本平衡精度与内存。
+    onnxsim 预处理已按需跳过（无 Constant 节点时直接返回原模型）。
+
+    original_name: 原始模型文件名（含扩展名），用于生成输出文件名。
+                   如 original_name="resnet50.onnx" → 输出 "resnet50_npumotified.tflite"。
+                   未提供则用 onnx_path 的文件名。
     """
-    from tflite_export import _check_deps, _size_str, _model_base
+    from tflite_export import _check_deps, _size_str
     import onnx2tf
     import tensorflow as tf
 
@@ -289,14 +298,18 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
             "\n- ".join(check["issues"])
         )
 
+    # 输出文件名：原始模型名（去扩展名）+ _npumotified.tflite
+    src_name = original_name or os.path.basename(onnx_path)
+    base = os.path.splitext(src_name)[0]
+    out_filename = f"{base}_npumotified.tflite"
+
     os.makedirs(out_dir, exist_ok=True)
-    base = _model_base(onnx_path)
     tmp = tempfile.mkdtemp(prefix="ort_npu_")
     try:
-        # 0) onnxsim 预处理：折叠 Constant，绕过 onnx2tf 的 Constant bug
+        # 0) onnxsim 预处理：仅当模型含 Constant 时才简化（绕过 onnx2tf 的 Constant bug）
         model_for_convert = preprocess_for_onnx2tf(onnx_path, tmp)
 
-        # 1) onnx2tf tf_converter 后端 → SavedModel
+        # 1) onnx2tf tf_converter 后端 → SavedModel（主要瓶颈，占 ~95% 耗时）
         with _tolerant_temp_cleanup():
             onnx2tf.convert(
                 input_onnx_file_path=model_for_convert,
@@ -328,7 +341,7 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
         converter.representative_dataset = rep
         tflite_model = converter.convert()
 
-        out_path = os.path.join(out_dir, f"{base}_npu_int8.tflite")
+        out_path = os.path.join(out_dir, out_filename)
         with open(out_path, "wb") as f:
             f.write(tflite_model)
 

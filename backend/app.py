@@ -296,15 +296,24 @@ def npu_check():
 def npu_export_api():
     """导出 QNN NPU 专用全 INT8 TFLite（需先通过合规检查）。"""
     data = request.get_json(force=True) or {}
-    path = _resolve_path(data.get("model_id"), data.get("path"))
+    mid = data.get("model_id")
+    path = _resolve_path(mid, data.get("path"))
     if not path:
         return _err("缺少 model_id 或 path")
+    # 取原始模型名用于输出文件命名（resnet50.onnx → resnet50_npumotified.tflite）
+    original_name = None
+    if mid:
+        with _LOCK:
+            rec = _MODELS.get(mid)
+        if rec:
+            original_name = rec.get("original_name") or rec.get("filename")
     calibration = data.get("calibration", "random")
-    num_samples = int(data.get("num_samples", 16))
+    num_samples = int(data.get("num_samples", 8))
     try:
         res = npu_export.export_npu_tflite(
             path, EXPORTS_DIR, calibration=calibration,
             num_samples=num_samples, images_dir=IMAGES_DIR,
+            original_name=original_name,
         )
         return _ok(res)
     except RuntimeError as e:

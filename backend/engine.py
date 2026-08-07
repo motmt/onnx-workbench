@@ -114,11 +114,18 @@ def preprocess_for_onnx2tf(onnx_path: str, work_dir: str) -> str:
     Constant 对象的 .op 属性而崩溃（'Constant' object has no attribute 'op'）。
     onnxsim 会把 Constant 折叠进 initializer，绕过该问题。
 
-    返回简化后的模型路径；onnxsim 不可用或失败时返回原路径。
+    性能优化：先检测模型是否含 Constant 节点，无则直接返回原路径（跳过 onnxsim），
+    避免对无需简化的模型做不必要的 shape inference。
+
+    返回简化后的模型路径；无 Constant / onnxsim 不可用 / 失败时返回原路径。
     """
     try:
-        import onnxsim
         model = onnx.load(onnx_path, load_external_data=False)
+        # 快速检测：无 Constant 节点则跳过 onnxsim（省 shape inference 开销）
+        has_constant = any(n.op_type == "Constant" for n in model.graph.node)
+        if not has_constant:
+            return onnx_path
+        import onnxsim
         simplified, ok = onnxsim.simplify(model)
         if ok:
             out_path = os.path.join(work_dir, os.path.basename(onnx_path))

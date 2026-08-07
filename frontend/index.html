@@ -601,7 +601,7 @@ $('#btnExportTflite').addEventListener('click', async ()=>{
   tfliteFiles = [];
   for(const pr of precisions){
     const {json} = await API('/api/tflite/export',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model_id:currentModel.id, precision:pr.p, calibration:calib, num_samples:16})});
+      body:JSON.stringify({model_id:currentModel.id, precision:pr.p, calibration:calib, num_samples:8})});
     if(json.ok){
       tfliteFiles.push({...json.data, tag:pr.tag, title:pr.t});
     } else {
@@ -710,11 +710,11 @@ $('#btnNpuExport').addEventListener('click', async ()=>{
   if(!npuState.checked || !npuState.compliant){
     toast('请先确认模型合规','','warn'); return;
   }
-  setStatus('NPU 导出中（全 INT8，较慢）…','busy');
+  setStatus('NPU 导出中（全 INT8 量化）…','busy');
   $('#btnNpuExport').disabled = true;
   const calib = document.querySelector('input[name=calib]:checked').value;
   const {json} = await API('/api/npu/export',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({model_id:currentModel.id, calibration:calib, num_samples:16})});
+    body:JSON.stringify({model_id:currentModel.id, calibration:calib, num_samples:8})});
   if(json.ok){
     const d = json.data;
     $('#npuResult').className = 'npu-result ok';
