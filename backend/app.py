@@ -95,61 +95,6 @@ def _file_sha256(stream) -> str:
     return h.hexdigest()
 
 
-def _cleanup_uploads():
-    """启动时清理 uploads 中【没用的模型】：
-    1. 孤儿文件：不在注册表里的 uploads/*.onnx（上传残留/中断）→ 删除
-    2. 重复副本：同 SHA-256 只保留最先注册的一个，其余删除
-    保留：唯一模型、校准图片（uploads/images）、导出产物（exports/）。
-
-    用户痛点：反复上传相同模型导致 uploads 堆积随机名副本。
-    删除用 Windows 原生 API（绕过沙箱 safe-delete 拦截）。
-    """
-    # 1) 孤儿文件（注册表外）
-    registered = {r.get("path") for r in _MODELS.values()}
-    for f in os.listdir(UPLOADS_DIR):
-        if not f.endswith(".onnx"):
-            continue
-        p = os.path.join(UPLOADS_DIR, f)
-        if p not in registered:
-            try:
-                ctypes.windll.kernel32.DeleteFileW(p)
-            except Exception:
-                pass
-
-    # 2) 重复副本（同 sha256 保留最先注册的一个）
-    seen: dict[str, str] = {}  # sha256 -> 保留的 model id
-    to_del: list[dict] = []
-    with _LOCK:
-        for mid, rec in list(_MODELS.items()):
-            p = rec.get("path", "")
-            if not p or not os.path.isfile(p):
-                to_del.append(rec)
-                continue
-            if rec.get("kind") != "onnx":
-                continue
-            sha = rec.get("sha256")
-            if not sha:
-                try:
-                    with open(p, "rb") as fh:
-                        sha = _file_sha256(fh)
-                    rec["sha256"] = sha
-                except Exception:
-                    continue
-            if sha in seen:
-                to_del.append(rec)
-            else:
-                seen[sha] = mid
-    for rec in to_del:
-        with _LOCK:
-            _MODELS.pop(rec.get("id"), None)
-        p = rec.get("path")
-        if p:
-            try:
-                ctypes.windll.kernel32.DeleteFileW(p)
-            except Exception:
-                pass
-
-
 def _load_registry():
     """启动时恢复注册表：先读 JSON，再扫描上传目录补齐缺失模型。"""
     if os.path.isfile(_REGISTRY_FILE):
@@ -169,7 +114,6 @@ def _load_registry():
 
 
 _load_registry()
-_cleanup_uploads()
 _save_registry()
 
 
