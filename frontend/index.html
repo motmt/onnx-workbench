@@ -475,11 +475,12 @@ async function selectModel(id){
   // 初始化对比表：放原始模型
   tableRows = [{
     name: '原始模型', path: json.data.path, filename: json.data.filename,
+    original_name: json.data.original_name,
     size_bytes: json.data.size_bytes, kind: 'orig', bm: null
   }];
   await benchmarkAll();
   renderTable();
-  toast('已加载', json.data.filename, 'ok');
+  toast('已加载', json.data.original_name || json.data.filename, 'ok');
 }
 
 function renderInfo(d){
@@ -617,7 +618,7 @@ function renderTable(){
     const runs = bm.runs||'—';
     return `<div class="table-row">
       <div><span class="badge-type ${badge}">${r.name}</span></div>
-      <div class="mono">${r.filename}</div>
+      <div class="mono" title="${r.filename}">${r.original_name || r.filename}</div>
       <div class="num">${(r.size_bytes/1048576).toFixed(2)}<span class="u">MB</span></div>
       <div>${runs}</div>
       <div>${bmCell}</div>

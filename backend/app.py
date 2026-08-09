@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import os
+import json
 import uuid
 import threading
 
@@ -47,21 +48,56 @@ app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # 512MB
 
 eng = OnnxEngine(uploads_dir=UPLOADS_DIR, exports_dir=EXPORTS_DIR, images_dir=IMAGES_DIR)
 
-# 简单的内存模型注册表（id -> {path, filename, ...}）
+# 简单的内存模型注册表（id -> {path, filename, original_name, ...}）
 _MODELS: dict[str, dict] = {}
 _LOCK = threading.Lock()
+# 注册表持久化文件：重启后恢复模型列表和原始文件名
+_REGISTRY_FILE = os.path.join(UPLOADS_DIR, ".registry.json")
 
 ALLOWED_MODEL_EXT = {".onnx"}
 ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def _register(path: str, kind: str = "onnx") -> dict:
+def _save_registry():
+    try:
+        with open(_REGISTRY_FILE, "w", encoding="utf-8") as f:
+            json.dump(_MODELS, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _register(path: str, kind: str = "onnx",
+              original_name: str = None) -> dict:
     mid = uuid.uuid4().hex[:12]
     rec = {"id": mid, "path": path, "filename": os.path.basename(path),
            "kind": kind, "size_bytes": os.path.getsize(path)}
+    if original_name:
+        rec["original_name"] = original_name
     with _LOCK:
         _MODELS[mid] = rec
+    _save_registry()
     return rec
+
+
+def _load_registry():
+    """启动时恢复注册表：先读 JSON，再扫描上传目录补齐缺失模型。"""
+    if os.path.isfile(_REGISTRY_FILE):
+        try:
+            with open(_REGISTRY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for mid, rec in data.items():
+                if rec.get("path") and os.path.isfile(rec["path"]):
+                    _MODELS[mid] = rec
+        except Exception:
+            pass
+    for f in sorted(os.listdir(UPLOADS_DIR)):
+        if f.endswith(".onnx"):
+            p = os.path.join(UPLOADS_DIR, f)
+            if not any(r["path"] == p for r in _MODELS.values()):
+                _register(p)
+
+
+_load_registry()
 
 
 def _ok(data=None, **kw):
@@ -145,8 +181,7 @@ def upload():
         save_name = f"model_{uuid.uuid4().hex[:8]}{ext}"
         save_path = os.path.join(UPLOADS_DIR, save_name)
         f.save(save_path)
-        rec = _register(save_path, kind="onnx")
-        rec["original_name"] = orig_name  # 原始显示名
+        rec = _register(save_path, kind="onnx", original_name=orig_name)
         return _ok({"type": "onnx", "model": rec, "original_name": orig_name})
     return _err(f"不支持的文件类型：{ext}")
 
@@ -166,6 +201,8 @@ def model_detail(mid):
     try:
         info = eng.load_model_info(rec["path"])
         info["id"] = mid
+        # 带上原始文件名（上传时的原名），前端表格/下拉框用
+        info["original_name"] = rec.get("original_name") or rec.get("filename")
         return _ok(info)
     except Exception as e:
         return _err(f"解析模型失败：{e}", 500)
