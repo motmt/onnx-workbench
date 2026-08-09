@@ -342,30 +342,84 @@ def recover_head_from_end2end(onnx_path: str, work_dir: str) -> tuple:
             if inp in producer:
                 stack.append(producer[inp])
 
-    # 4. 在祖先节点输出中找检测头候选（3 维，某维在 5~256 = 4+类别数）
-    #    取节点序号最大者（最接近 NMS，且必然在 NMS 之前）
-    candidates = []
-    for idx in ancestors:
+    # 4a. 优先找 reg/cls 分离（Split）或合并（Concat）结构的【完整检测头】：
+    #     - Split: 通道维按 [4, Nc] 或 [Nc, 4] 拆分 → 输入即完整检测头 [1,A,4+Nc]
+    #     - Concat: 输入含 reg[1,4,N] + cls[1,Nc,N] → 输出即完整检测头
+    #     这类张量是 NMS 后处理链之前的原始检测头，选它做输出才能让
+    #     onnxsim 剪掉整个 NMS 子图（含 TopK/GatherElements/ReduceMax 等）。
+    #     否则会误选 NMS 链中间张量（如 GatherElements 输出 [1,300,8]），
+    #     导致黑名单算子残留、模型不合规。
+    head_name = None
+    head_shape = None
+    for idx in sorted(ancestors, reverse=True):  # 从最接近 NMS 的开始
         node = model.graph.node[idx]
-        for out in node.output:
-            if not out or out in graph_inputs:
+        if node.op_type == "Split":
+            axis = next((a.i for a in node.attribute if a.name == "axis"), 1)
+            sizes = [a.ints for a in node.attribute if a.name == "split"]
+            if not sizes or len(sizes[0]) != 2 or 4 not in sizes[0]:
                 continue
-            vi = vi_map.get(out)
+            if sizes[0][0] + sizes[0][1] <= 4:
+                continue
+            inp = node.input[0]
+            vi = vi_map.get(inp)
             if vi is None:
                 continue
-            shape = _input_shape(vi)
-            if len(shape) != 3 or not all(d > 0 for d in shape):
+            s = _input_shape(vi)
+            if len(s) != 3 or not all(d > 0 for d in s):
                 continue
-            d1, d2 = shape[1], shape[2]
-            if (5 <= d1 <= 256 and d2 >= 1) or (5 <= d2 <= 256 and d1 >= 1):
-                candidates.append((idx, out, shape))
+            c_axis = s[axis] if axis in (1, -2) else s[-1]
+            if c_axis != sizes[0][0] + sizes[0][1]:
+                continue
+            head_name, head_shape = inp, s
+            break
+        elif node.op_type == "Concat":
+            axis = next((a.i for a in node.attribute if a.name == "axis"), 1)
+            if axis not in (1, -2):
+                continue
+            for out in node.output:
+                if not out:
+                    continue
+                vi = vi_map.get(out)
+                if vi is None:
+                    continue
+                s = _input_shape(vi)
+                if len(s) != 3 or not all(d > 0 for d in s):
+                    continue
+                c_dim = s[1] if axis == 1 else s[-1]
+                nc = c_dim - 4
+                if not (5 <= c_dim <= 256 and nc >= 1):
+                    continue
+                in_shapes = [_input_shape(vi_map.get(i)) for i in node.input
+                             if i in vi_map]
+                if any(len(sh) == 3 and sh[1] == 4 for sh in in_shapes) and \
+                   any(len(sh) == 3 and sh[1] == nc for sh in in_shapes):
+                    head_name, head_shape = out, s
+                    break
+            if head_name:
+                break
 
-    if not candidates:
-        return onnx_path, None
-
-    # 取最接近 NMS 的候选
-    candidates.sort(key=lambda x: x[0])
-    head_idx, head_name, head_shape = candidates[-1]
+    # 4b. 回退：在祖先节点输出中找 3 维候选（某维在 5~256 = 4+类别数），
+    #     取节点序号最大者（最接近 NMS）
+    if head_name is None:
+        candidates = []
+        for idx in ancestors:
+            node = model.graph.node[idx]
+            for out in node.output:
+                if not out or out in graph_inputs:
+                    continue
+                vi = vi_map.get(out)
+                if vi is None:
+                    continue
+                shape = _input_shape(vi)
+                if len(shape) != 3 or not all(d > 0 for d in shape):
+                    continue
+                d1, d2 = shape[1], shape[2]
+                if (5 <= d1 <= 256 and d2 >= 1) or (5 <= d2 <= 256 and d1 >= 1):
+                    candidates.append((idx, out, shape))
+        if not candidates:
+            return onnx_path, None
+        candidates.sort(key=lambda x: x[0])
+        head_idx, head_name, head_shape = candidates[-1]
 
     # 5. 替换图输出：删除原输出，用检测头张量作为新输出
     #    （保留原张量名，ONNX 输出 ValueInfo 的 name 必须匹配图中张量）
@@ -443,8 +497,40 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
         return s if all(d > 0 for d in s) else None
 
     nc = c_dim - 4
+
+    def _emit(reg, cls, reg_shape, cls_shape, nc_out):
+        """在 reg/cls 分支末端加 Identity 改名输出（reg_out/cls_out）。
+
+        - 输出名必须合法（不含 '/'），否则 onnx2tf 生成 TF op name 时
+          报 "OP name does not match pattern"
+        - Identity 不改变量化传播：reg_out 传播自上游算术算子（像素大 scale
+          独立校准），cls_out 传播自 Sigmoid（输出 [0,1] → scale=1/256）
+        """
+        from onnx import TensorProto
+        reg_id = helper.make_node("Identity", [reg], ["reg_out"], name="src_split_reg")
+        cls_id = helper.make_node("Identity", [cls], ["cls_out"], name="src_split_cls")
+        reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_shape)
+        cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_shape)
+        old_outputs = list(model.graph.output)
+        while model.graph.output:
+            model.graph.output.pop()
+        model.graph.output.extend([reg_vi, cls_vi])
+        model.graph.node.extend([reg_id, cls_id])
+        out_path = os.path.join(work_dir, "split_src.onnx")
+        try:
+            onnx.save(model, out_path)
+        except Exception:
+            # 保存失败：恢复原输出和节点，回退 Slice 方案
+            model.graph.node.remove(reg_id)
+            model.graph.node.remove(cls_id)
+            while model.graph.output:
+                model.graph.output.pop()
+            model.graph.output.extend(old_outputs)
+            return None
+        return out_path, nc_out
+
     # 从输出张量向上回溯：数据移动算子（Transpose/Reshape/Identity）继续，
-    # 遇到 Concat 检查其输入是否为 reg[1,4,N] + cls[1,Nc,N]
+    # 遇到 Concat（reg/cls 合并型）或 Split（reg/cls 分离型）直接拆分
     cur = out_vi.name
     visited = set()
     while cur in producer and cur not in visited:
@@ -452,6 +538,35 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
         idx = producer[cur]
         node = model.graph.node[idx]
         op = node.op_type
+        if op == "Split":
+            # reg/cls 分离型：Split 把完整检测头 [1,A,4+Nc] 拆成 reg + cls
+            axis = next((a.i for a in node.attribute if a.name == "axis"), 1)
+            sizes = [a.ints for a in node.attribute if a.name == "split"]
+            if not sizes or len(sizes[0]) != 2 or 4 not in sizes[0]:
+                return None
+            if len(node.output) < 2:
+                return None
+            s0, s1 = tshape(node.output[0]), tshape(node.output[1])
+            if not s0 or not s1 or len(s0) != 3 or len(s1) != 3:
+                return None
+            # 通道维（CN: axis=1；NC: axis=-1/最后一维）
+            if axis in (1, -2):
+                c0, c1, n0, n1 = s0[1], s1[1], s0[2], s1[2]
+            else:
+                c0, c1, n0, n1 = s0[-1], s1[-1], s0[1], s1[1]
+            if n0 != n1:
+                return None
+            reg = cls = None
+            reg_shape = cls_shape = None
+            for o, c, s in ((node.output[0], c0, s0), (node.output[1], c1, s1)):
+                if c == 4:
+                    reg, reg_shape = o, s
+                elif 1 <= c <= 256:
+                    cls, cls_shape = o, s
+            if not (reg and cls):
+                return None
+            nc_out = cls_shape[1] if axis in (1, -2) else cls_shape[-1]
+            return _emit(reg, cls, reg_shape, cls_shape, nc_out)
         if op == "Concat":
             axis = 1
             for attr in node.attribute:
@@ -488,33 +603,8 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
                         break
             if not (reg and cls):
                 return None
-            # 找到合并点：加 Identity 改名输出。
-            #  - 输出名必须合法（reg_out/cls_out），否则 onnx2tf 生成 TF op name
-            #    时因 ONNX 张量名含 '/' 而报 "OP name does not match pattern"
-            #  - Identity 不改变量化传播：reg_out 传播自 Mul（像素大 scale 独立校准），
-            #    cls_out 传播自 Sigmoid（输出 [0,1] → scale=1/256）
-            from onnx import TensorProto
-            reg_id = helper.make_node("Identity", [reg], ["reg_out"], name="src_split_reg")
-            cls_id = helper.make_node("Identity", [cls], ["cls_out"], name="src_split_cls")
-            reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, [1, 4, n_dim])
-            cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, [1, nc, n_dim])
-            old_outputs = list(model.graph.output)
-            while model.graph.output:
-                model.graph.output.pop()
-            model.graph.output.extend([reg_vi, cls_vi])
-            model.graph.node.extend([reg_id, cls_id])
-            out_path = os.path.join(work_dir, "split_src.onnx")
-            try:
-                onnx.save(model, out_path)
-            except Exception:
-                # 保存失败：恢复原输出和节点，回退 Slice 方案
-                model.graph.node.remove(reg_id)
-                model.graph.node.remove(cls_id)
-                while model.graph.output:
-                    model.graph.output.pop()
-                model.graph.output.extend(old_outputs)
-                return None
-            return out_path, nc
+            # 找到合并点：在分支末端加 Identity 输出（见 _emit 注释）
+            return _emit(reg, cls, [1, 4, n_dim], [1, nc, n_dim], nc)
         elif op in {"Transpose", "Reshape", "Identity", "Squeeze",
                     "Unsqueeze", "Flatten"}:
             cur = node.input[0]
