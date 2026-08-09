@@ -467,7 +467,14 @@ $('#modelSelect').addEventListener('change', async (e)=>{
 
 async function selectModel(id){
   const {json} = await API('/api/model/'+id);
-  if(!json.ok){ toast('加载失败', json.error, 'err'); return; }
+  if(!json.ok){
+    toast('加载失败', json.error, 'err');
+    // 模型文件可能已被删除：刷新列表让已删模型消失
+    currentModel = null;
+    await loadModelList();
+    $('#infoArea').innerHTML='';
+    return;
+  }
   currentModel = json.data;
   // 同步选中
   $('#modelSelect').value = id;

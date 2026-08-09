@@ -218,8 +218,25 @@ def upload():
 
 @app.get("/api/models")
 def list_models():
+    """列出模型：只返回文件实际存在的记录。
+
+    用户手动删除 uploads 里的模型文件后，运行中的服务内存注册表
+    仍持有旧记录——这里实时检查文件存在性，不存在的自动剔除。
+    """
+    gone = []
+    live = []
     with _LOCK:
-        return _ok({"models": list(_MODELS.values())})
+        for mid, rec in list(_MODELS.items()):
+            p = rec.get("path", "")
+            if p and os.path.isfile(p):
+                live.append(rec)
+            else:
+                gone.append(mid)
+        for mid in gone:
+            _MODELS.pop(mid, None)
+    if gone:
+        _save_registry()
+    return _ok({"models": live})
 
 
 @app.get("/api/model/<mid>")
@@ -228,6 +245,12 @@ def model_detail(mid):
         rec = _MODELS.get(mid)
     if not rec:
         return _err("模型不存在", 404)
+    # 文件已被删除：清理记录并友好提示（前端将刷新列表）
+    if not rec.get("path") or not os.path.isfile(rec["path"]):
+        with _LOCK:
+            _MODELS.pop(mid, None)
+        _save_registry()
+        return _err("模型文件已被删除，已从列表移除", 410)
     try:
         info = eng.load_model_info(rec["path"])
         info["id"] = mid
