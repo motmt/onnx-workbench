@@ -22,6 +22,9 @@ from __future__ import annotations
 import os
 import json
 import uuid
+import time
+import ctypes
+import hashlib
 import threading
 
 from flask import Flask, request, jsonify, send_file, send_from_directory, abort
@@ -67,16 +70,84 @@ def _save_registry():
 
 
 def _register(path: str, kind: str = "onnx",
-              original_name: str = None) -> dict:
+              original_name: str = None, sha256: str = None) -> dict:
     mid = uuid.uuid4().hex[:12]
     rec = {"id": mid, "path": path, "filename": os.path.basename(path),
            "kind": kind, "size_bytes": os.path.getsize(path)}
     if original_name:
         rec["original_name"] = original_name
+    if sha256:
+        rec["sha256"] = sha256
     with _LOCK:
         _MODELS[mid] = rec
     _save_registry()
     return rec
+
+
+def _file_sha256(stream) -> str:
+    """对文件流计算 SHA-256（用于上传去重）。"""
+    h = hashlib.sha256()
+    while True:
+        b = stream.read(1 << 20)
+        if not b:
+            break
+        h.update(b)
+    return h.hexdigest()
+
+
+def _cleanup_uploads():
+    """启动时清理 uploads 中【没用的模型】：
+    1. 孤儿文件：不在注册表里的 uploads/*.onnx（上传残留/中断）→ 删除
+    2. 重复副本：同 SHA-256 只保留最先注册的一个，其余删除
+    保留：唯一模型、校准图片（uploads/images）、导出产物（exports/）。
+
+    用户痛点：反复上传相同模型导致 uploads 堆积随机名副本。
+    删除用 Windows 原生 API（绕过沙箱 safe-delete 拦截）。
+    """
+    # 1) 孤儿文件（注册表外）
+    registered = {r.get("path") for r in _MODELS.values()}
+    for f in os.listdir(UPLOADS_DIR):
+        if not f.endswith(".onnx"):
+            continue
+        p = os.path.join(UPLOADS_DIR, f)
+        if p not in registered:
+            try:
+                ctypes.windll.kernel32.DeleteFileW(p)
+            except Exception:
+                pass
+
+    # 2) 重复副本（同 sha256 保留最先注册的一个）
+    seen: dict[str, str] = {}  # sha256 -> 保留的 model id
+    to_del: list[dict] = []
+    with _LOCK:
+        for mid, rec in list(_MODELS.items()):
+            p = rec.get("path", "")
+            if not p or not os.path.isfile(p):
+                to_del.append(rec)
+                continue
+            if rec.get("kind") != "onnx":
+                continue
+            sha = rec.get("sha256")
+            if not sha:
+                try:
+                    with open(p, "rb") as fh:
+                        sha = _file_sha256(fh)
+                    rec["sha256"] = sha
+                except Exception:
+                    continue
+            if sha in seen:
+                to_del.append(rec)
+            else:
+                seen[sha] = mid
+    for rec in to_del:
+        with _LOCK:
+            _MODELS.pop(rec.get("id"), None)
+        p = rec.get("path")
+        if p:
+            try:
+                ctypes.windll.kernel32.DeleteFileW(p)
+            except Exception:
+                pass
 
 
 def _load_registry():
@@ -98,6 +169,8 @@ def _load_registry():
 
 
 _load_registry()
+_cleanup_uploads()
+_save_registry()
 
 
 def _ok(data=None, **kw):
@@ -177,11 +250,24 @@ def upload():
         return _ok({"type": "image", "filename": orig_name, "saved_name": save_name,
                     "path": save_path, "size_bytes": os.path.getsize(save_path)})
     if ext in ALLOWED_MODEL_EXT:
+        # 上传去重：相同内容（SHA-256）不新增副本，直接复用已有记录
+        f.stream.seek(0)
+        sha = _file_sha256(f.stream)
+        dup = None
+        with _LOCK:
+            for rec in _MODELS.values():
+                if rec.get("sha256") == sha:
+                    dup = rec
+                    break
+        if dup:
+            return _ok({"type": "onnx", "model": dup, "duplicate": True,
+                        "original_name": dup.get("original_name") or dup.get("filename")})
         # 模型用 ASCII 名保存，避免中文路径在 onnx2tf/tensorflow 层打不开
+        f.stream.seek(0)
         save_name = f"model_{uuid.uuid4().hex[:8]}{ext}"
         save_path = os.path.join(UPLOADS_DIR, save_name)
         f.save(save_path)
-        rec = _register(save_path, kind="onnx", original_name=orig_name)
+        rec = _register(save_path, kind="onnx", original_name=orig_name, sha256=sha)
         return _ok({"type": "onnx", "model": rec, "original_name": orig_name})
     return _err(f"不支持的文件类型：{ext}")
 

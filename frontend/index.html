@@ -512,6 +512,7 @@ $('#fileModel').addEventListener('change', async (e)=>{
     await loadModelList();
     await selectModel(j.data.model.id);
     setStatus('就绪','ok');
+    if(j.data.duplicate) toast('相同模型已存在','已复用现有记录，未重复上传','warn');
   } else { toast('上传失败', j.error,'err'); setStatus('就绪'); }
 });
 
