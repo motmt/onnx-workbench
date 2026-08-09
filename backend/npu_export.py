@@ -69,6 +69,30 @@ def check_npu_compliance(onnx_path: str) -> dict:
     model = onnx.load(onnx_path, load_external_data=False)
     issues = []
     warnings = []
+    recovered = False
+
+    # ---- 0. end2end NMS 模型：自动还原原始检测头 ----
+    # 含 TopK/NonMaxSuppression 的模型（如输出 [1,300,6]）不能直接上 QNN NPU，
+    # 但原始 anchor-free 检测头信息还在图里。参考 yezijinn 项目的
+    # recover_head_from_end2end：剪掉 NMS 子图、把 NMS 前的检测头输出设为图输出，
+    # 再按还原后的模型继续检查。还原失败则按原模型检查（NMS 会被黑名单拒绝）。
+    _nms_ops = {"TopK", "NonMaxSuppression"}
+    if any(n.op_type in _nms_ops for n in model.graph.node):
+        work_dir = tempfile.mkdtemp(prefix="ort_npu_chk_")
+        try:
+            rec_path, rec_info = recover_head_from_end2end(onnx_path, work_dir)
+            if rec_info and rec_info.get("recovered"):
+                model = onnx.load(rec_path, load_external_data=False)
+                recovered = True
+                warnings.append(
+                    f"检测到 end2end(NMS) 模型，已自动还原原始检测头"
+                    f"（输出 {rec_info.get('output_shape')}，"
+                    f"NMS 剪除: {rec_info.get('nms_removed')}）"
+                )
+        except Exception as e:
+            warnings.append(f"end2end NMS 还原失败（{e}），按原模型检查")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     inputs = [vi for vi in model.graph.input
               if vi.name not in {i.name for i in model.graph.initializer}]
@@ -79,6 +103,7 @@ def check_npu_compliance(onnx_path: str) -> dict:
         "filename": os.path.basename(onnx_path),
         "num_inputs": len(inputs),
         "num_outputs": len(outputs),
+        "recovered": recovered,
         "ops": sorted(set(ops)),
         "op_counts": {op: ops.count(op) for op in sorted(set(ops))},
     }
@@ -163,34 +188,36 @@ def check_npu_compliance(onnx_path: str) -> dict:
                     )
 
         elif len(outputs) == 2 and all(len(o["shape"]) == 3 for o in out_shapes):
-            # 双拆分：一个通道维=4（框），另一个=类别数
+            # 双拆分：一个通道维=4（框 reg），另一个=类别数 cls
+            # （源头拆分：reg[1,4,N] + cls[1,Nc,N]，cls 通道=纯类别数）
             s0, s1 = out_shapes[0]["shape"], out_shapes[1]["shape"]
             # 找哪个是框（通道维=4）
             def _channel_dim(s):
-                if 5 <= s[1] <= 256:
+                # 通道维：4（框）或 1~256（类别数）
+                if s[1] == 4 or 5 <= s[1] <= 256:
                     return s[1], s[2], "[1,C,N]"
-                if 5 <= s[2] <= 256:
+                if s[2] == 4 or 5 <= s[2] <= 256:
                     return s[2], s[1], "[1,N,C]"
                 return -1, -1, "?"
 
             c0, n0, l0 = _channel_dim(s0)
             c1, n1, l1 = _channel_dim(s1)
-            # 一个应该是 4（框）
-            if c0 == 4 and c1 > 4:
-                num_classes = c1 - 4
+            # 一个应该是 4（框），另一个是类别数
+            if c0 == 4 and 1 <= c1 <= 256:
+                num_classes = c1
                 info["num_classes"] = num_classes
                 info["output_mode"] = "split"
                 if n0 != n1:
                     issues.append(f"双输出候选数不一致：{n0} vs {n1}，必须相同")
-            elif c1 == 4 and c0 > 4:
-                num_classes = c0 - 4
+            elif c1 == 4 and 1 <= c0 <= 256:
+                num_classes = c0
                 info["num_classes"] = num_classes
                 info["output_mode"] = "split"
                 if n0 != n1:
                     issues.append(f"双输出候选数不一致：{n0} vs {n1}，必须相同")
             else:
                 issues.append(
-                    f"双输出需一个通道维=4（框），另一个=4+类别数。"
+                    f"双输出需一个通道维=4（框），另一个=类别数。"
                     f"实际 {s0} / {s1}"
                 )
 
@@ -261,6 +288,241 @@ def _build_rep_dataset(onnx_path: str, calibration: str,
     return gen
 
 
+def recover_head_from_end2end(onnx_path: str, work_dir: str) -> tuple:
+    """检测并还原含 NMS 的 end2end 模型。
+
+    参考 yezijinn/onnx_to_int8.tflite 项目的 recover_head_from_end2end 设计：
+    1. 检测 NMS 算子（TopK/NonMaxSuppression，含 TRT 风格 FastNMS）
+    2. 从 NMS 输入反向遍历图，收集"NMS 祖先"节点（NMS 之前产生的依赖子图）
+    3. 在祖先中找 3 维检测头输出 [1,C,A]（C=4+类别数，5≤C≤256），
+       取最接近 NMS 的（节点序号最大）——避免误选 NMS 之后的
+       [1,300,6] 后处理张量（那样 NMS 子图剪不掉）
+    4. 把检测头张量设为图输出，onnxsim 剪掉 NMS 悬空子图
+
+    返回 (recovered_model_path, info_dict)；
+    无 NMS 或还原失败时返回 (onnx_path, None)。
+    """
+    model = onnx.load(onnx_path, load_external_data=False)
+
+    # 1. 检测 NMS 相关算子（含 TRT 风格 TopK FastNMS）
+    nms_ops = {"TopK", "NonMaxSuppression"}
+    nms_idx = [i for i, n in enumerate(model.graph.node) if n.op_type in nms_ops]
+    if not nms_idx:
+        return onnx_path, None
+
+    # 2. shape inference（非严格模式，尽可能推断中间张量形状）
+    try:
+        model_inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+    except Exception:
+        model_inferred = model
+    vi_map = {vi.name: vi for vi in model_inferred.graph.value_info}
+    for o in model_inferred.graph.output:
+        vi_map.setdefault(o.name, o)
+
+    # 3. 从 NMS 输入反向遍历，收集祖先节点（NMS 之前的依赖子图）
+    graph_inputs = {i.name for i in model.graph.input}
+    producer = {}  # tensor_name -> 产生它的节点下标
+    for idx, node in enumerate(model.graph.node):
+        for out in node.output:
+            if out:
+                producer[out] = idx
+
+    ancestors = set()
+    stack = []
+    for i in nms_idx:
+        for inp in model.graph.node[i].input:
+            if inp in producer:
+                stack.append(producer[inp])
+    while stack:
+        idx = stack.pop()
+        if idx in ancestors:
+            continue
+        ancestors.add(idx)
+        for inp in model.graph.node[idx].input:
+            if inp in producer:
+                stack.append(producer[inp])
+
+    # 4. 在祖先节点输出中找检测头候选（3 维，某维在 5~256 = 4+类别数）
+    #    取节点序号最大者（最接近 NMS，且必然在 NMS 之前）
+    candidates = []
+    for idx in ancestors:
+        node = model.graph.node[idx]
+        for out in node.output:
+            if not out or out in graph_inputs:
+                continue
+            vi = vi_map.get(out)
+            if vi is None:
+                continue
+            shape = _input_shape(vi)
+            if len(shape) != 3 or not all(d > 0 for d in shape):
+                continue
+            d1, d2 = shape[1], shape[2]
+            if (5 <= d1 <= 256 and d2 >= 1) or (5 <= d2 <= 256 and d1 >= 1):
+                candidates.append((idx, out, shape))
+
+    if not candidates:
+        return onnx_path, None
+
+    # 取最接近 NMS 的候选
+    candidates.sort(key=lambda x: x[0])
+    head_idx, head_name, head_shape = candidates[-1]
+
+    # 5. 替换图输出：删除原输出，用检测头张量作为新输出
+    #    （保留原张量名，ONNX 输出 ValueInfo 的 name 必须匹配图中张量）
+    new_outputs = list(model.graph.output)
+    while model.graph.output:
+        model.graph.output.pop()
+    from onnx import ValueInfoProto
+    new_vi = ValueInfoProto()
+    new_vi.CopyFrom(vi_map[head_name])
+    model.graph.output.extend([new_vi])
+
+    # 6. 保存并跑 onnxsim 剪掉 NMS 悬空子图
+    pre_path = os.path.join(work_dir, "pre_recover.onnx")
+    onnx.save(model, pre_path)
+
+    try:
+        import onnxsim
+        simplified, ok = onnxsim.simplify(pre_path)
+        if ok:
+            out_path = os.path.join(work_dir, "recovered.onnx")
+            onnx.save(simplified, out_path)
+            sm = onnx.load(out_path, load_external_data=False)
+            out_shape = _input_shape(sm.graph.output[0]) if sm.graph.output else []
+            # 验证剪枝后还有 TopK 吗（应该被剪掉了）
+            remaining_nms = [n for n in sm.graph.node if n.op_type in nms_ops]
+            return out_path, {
+                "recovered": True,
+                "output_shape": out_shape,
+                "nms_removed": len(remaining_nms) == 0,
+                "head_tensor": head_name,
+                "original_outputs": [o.name for o in new_outputs],
+            }
+    except Exception:
+        pass
+
+    # onnxsim 失败，返回预处理模型（可能含 NMS 子图但输出已改）
+    return pre_path, {"recovered": True, "note": "onnxsim partial, output redirected"}
+
+
+def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
+                      work_dir: str) -> tuple:
+    """源头拆分：回溯到 Concat 合并点，在 reg/cls 分支【合并之前】拆分。
+
+    参考 yezijinn/onnx_to_int8.tflite 项目设计（DM4 契约）：
+    - reg 输出取自 reg 分支末端（Mul/Add/Sub/Conv 等算术算子输出，像素值域大）
+    - cls 输出取自 cls 分支末端（Sigmoid/Softmax 输出，值域 [0,1]）
+    这样 TFLiteConverter 量化时两个输出【各自独立校准】：
+    cls 自动得到 scale≈1/256（LOGISTIC 约束），reg 得到像素级大 scale。
+    而 Slice/Split 拆分（对合并后联合张量）会让 cls 继承父联合范围被压扁。
+
+    对 4 类模型（reg/cls 形状相同 [1,4,N]），用 producer 算子类型区分：
+    Sigmoid/Softmax 产出的输入是 cls，另一个是 reg。
+
+    返回 (split_model_path, num_classes)；找不到合并点返回 None。
+    """
+    try:
+        mi = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+    except Exception:
+        return None
+    vi_map = {vi.name: vi for vi in mi.graph.value_info}
+    for o in mi.graph.output:
+        vi_map.setdefault(o.name, o)
+
+    producer = {}
+    for idx, n in enumerate(model.graph.node):
+        for out in n.output:
+            if out:
+                producer[out] = idx
+
+    def tshape(name):
+        vi = vi_map.get(name)
+        if vi is None:
+            return None
+        s = _input_shape(vi)
+        return s if all(d > 0 for d in s) else None
+
+    nc = c_dim - 4
+    # 从输出张量向上回溯：数据移动算子（Transpose/Reshape/Identity）继续，
+    # 遇到 Concat 检查其输入是否为 reg[1,4,N] + cls[1,Nc,N]
+    cur = out_vi.name
+    visited = set()
+    while cur in producer and cur not in visited:
+        visited.add(cur)
+        idx = producer[cur]
+        node = model.graph.node[idx]
+        op = node.op_type
+        if op == "Concat":
+            axis = 1
+            for attr in node.attribute:
+                if attr.name == "axis":
+                    axis = attr.i
+            if axis not in (1, -2):
+                return None
+            # 收集形状匹配的候选输入（reg[1,4,N] 或 cls[1,nc,N]）
+            candidates = []
+            for inp in node.input:
+                s = tshape(inp)
+                if not s or len(s) != 3 or s[2] != n_dim or s[1] not in (4, nc):
+                    continue
+                candidates.append(inp)
+            if len(candidates) < 2:
+                return None
+            # 形状区分：reg 通道维=4，cls 通道维=nc（nc!=4 时形状可区分）
+            reg = cls = None
+            for inp in candidates:
+                s = tshape(inp)
+                if s[1] == 4 and reg is None:
+                    reg = inp
+                elif s[1] == nc and nc != 4 and cls is None:
+                    cls = inp
+            # 形状无法区分（nc==4）时，用 producer 算子类型区分：Sigmoid/Softmax→cls
+            if reg and not cls:
+                for inp in candidates:
+                    if inp == reg:
+                        continue
+                    pidx = producer.get(inp)
+                    if pidx is not None and \
+                            model.graph.node[pidx].op_type in {"Sigmoid", "Softmax"}:
+                        cls = inp
+                        break
+            if not (reg and cls):
+                return None
+            # 找到合并点：加 Identity 改名输出。
+            #  - 输出名必须合法（reg_out/cls_out），否则 onnx2tf 生成 TF op name
+            #    时因 ONNX 张量名含 '/' 而报 "OP name does not match pattern"
+            #  - Identity 不改变量化传播：reg_out 传播自 Mul（像素大 scale 独立校准），
+            #    cls_out 传播自 Sigmoid（输出 [0,1] → scale=1/256）
+            from onnx import TensorProto
+            reg_id = helper.make_node("Identity", [reg], ["reg_out"], name="src_split_reg")
+            cls_id = helper.make_node("Identity", [cls], ["cls_out"], name="src_split_cls")
+            reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, [1, 4, n_dim])
+            cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, [1, nc, n_dim])
+            old_outputs = list(model.graph.output)
+            while model.graph.output:
+                model.graph.output.pop()
+            model.graph.output.extend([reg_vi, cls_vi])
+            model.graph.node.extend([reg_id, cls_id])
+            out_path = os.path.join(work_dir, "split_src.onnx")
+            try:
+                onnx.save(model, out_path)
+            except Exception:
+                # 保存失败：恢复原输出和节点，回退 Slice 方案
+                model.graph.node.remove(reg_id)
+                model.graph.node.remove(cls_id)
+                while model.graph.output:
+                    model.graph.output.pop()
+                model.graph.output.extend(old_outputs)
+                return None
+            return out_path, nc
+        elif op in {"Transpose", "Reshape", "Identity", "Squeeze",
+                    "Unsqueeze", "Flatten"}:
+            cur = node.input[0]
+        else:
+            return None
+    return None
+
+
 def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     """把 YOLO 单输出 [1,C,N] 拆成 reg[1,4,N] + cls[1,Nc,N] 双输出。
 
@@ -295,6 +557,17 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     if nc < 1:
         return onnx_path, None
 
+    # 1. 源头拆分：回溯 Concat 合并点，在 reg/cls 分支合并前拆分。
+    #    cls 分支末端是 Sigmoid → TFLite 独立量化 scale=1/256（满足 LOGISTIC）；
+    #    reg 分支末端是算术算子 → 像素级大 scale 独立校准。
+    try:
+        result = _try_source_split(model, out_vi, c_dim, n_dim, work_dir)
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # 2. 回退：Slice + Identity 拆分（联合量化，cls 精度稍差但可用）
     out_name = out_vi.name
     from onnx import TensorProto, numpy_helper
 
@@ -388,6 +661,15 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
     try:
         # 0) onnxsim 预处理：仅当模型含 Constant 时才简化（绕过 onnx2tf 的 Constant bug）
         model_for_convert = preprocess_for_onnx2tf(onnx_path, tmp)
+
+        # 0.3) end2end NMS 检测头还原（参考 yezijinn 项目）：
+        #   合规检查已判定为 NMS 模型时，剪掉 NMS 子图、还原原始检测头输出。
+        #   注意：这里重新还原一次拿模型文件（check 阶段的还原结果在临时目录已清理）。
+        if check["info"].get("recovered"):
+            model_for_convert, rec_info = recover_head_from_end2end(model_for_convert, tmp)
+            if not (rec_info and rec_info.get("recovered")):
+                raise RuntimeError("end2end NMS 检测头还原失败，无法继续导出")
+            check["info"]["recover_info"] = rec_info
 
         # 0.5) 双输出源头拆分：单输出 [1,C,N] → reg[1,4,N] + cls[1,Nc,N]
         #   用 Slice+Identity 在 ONNX 图层面拆分（禁止 TFLiteConverter 的 Split），
