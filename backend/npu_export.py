@@ -261,6 +261,86 @@ def _build_rep_dataset(onnx_path: str, calibration: str,
     return gen
 
 
+def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
+    """把 YOLO 单输出 [1,C,N] 拆成 reg[1,4,N] + cls[1,Nc,N] 双输出。
+
+    参考 yezijinn/onnx_to_int8.tflite 项目的设计：
+    在 ONNX 图层面用 Slice + Identity 源头拆分（禁止用 TFLiteConverter 的 Split，
+    因为 Split 会继承父联合范围压扁 cls 量化）。
+    拆分后 cls 有独立量化范围，TFLiteConverter 自动算出 scale≈1/256（满足 LOGISTIC 约束）。
+
+    返回 (split_model_path, num_classes)；
+    如果模型不是单输出原料型（已是双输出/无法识别通道维），返回 (onnx_path, None)。
+    """
+    model = onnx.load(onnx_path, load_external_data=False)
+    outputs = list(model.graph.output)
+    if len(outputs) != 1:
+        return onnx_path, None
+
+    out_vi = outputs[0]
+    shape = _input_shape(out_vi)
+    if len(shape) != 3:
+        return onnx_path, None
+
+    dim1, dim2 = shape[1], shape[2]
+    # 判断哪个是通道维（C 在 5-256，即 4+类别数）
+    if 5 <= dim1 <= 256:
+        c_dim, n_dim, layout = dim1, dim2, "CN"   # [1,C,N]
+    elif 5 <= dim2 <= 256:
+        c_dim, n_dim, layout = dim2, dim1, "NC"   # [1,N,C]
+    else:
+        return onnx_path, None
+
+    nc = c_dim - 4
+    if nc < 1:
+        return onnx_path, None
+
+    out_name = out_vi.name
+    from onnx import TensorProto, numpy_helper
+
+    # Slice 参数（按通道维切分：前4=reg框，剩余=cls类别分数）
+    if layout == "CN":
+        reg_starts, reg_ends = [0, 0, 0], [1, 4, n_dim]
+        cls_starts, cls_ends = [0, 4, 0], [1, c_dim, n_dim]
+        reg_shape, cls_shape = [1, 4, n_dim], [1, nc, n_dim]
+    else:
+        reg_starts, reg_ends = [0, 0, 0], [1, n_dim, 4]
+        cls_starts, cls_ends = [0, 0, 4], [1, n_dim, c_dim]
+        reg_shape, cls_shape = [1, n_dim, 4], [1, n_dim, nc]
+
+    axes = [0, 1, 2]
+    # Slice 节点（opset 10+ 用输入而非属性）
+    reg_slice = helper.make_node("Slice",
+        inputs=[out_name, "reg_starts", "reg_ends", "split_axes"],
+        outputs=["reg_mid"], name="split_reg")
+    cls_slice = helper.make_node("Slice",
+        inputs=[out_name, "cls_starts", "cls_ends", "split_axes"],
+        outputs=["cls_mid"], name="split_cls")
+    # Identity 节点（创建独立输出张量，确保 TFLiteConverter 独立量化）
+    reg_identity = helper.make_node("Identity", ["reg_mid"], ["reg_out"], name="reg_identity")
+    cls_identity = helper.make_node("Identity", ["cls_mid"], ["cls_out"], name="cls_identity")
+
+    inits = [
+        numpy_helper.from_array(np.array(reg_starts, dtype=np.int64), "reg_starts"),
+        numpy_helper.from_array(np.array(reg_ends, dtype=np.int64), "reg_ends"),
+        numpy_helper.from_array(np.array(cls_starts, dtype=np.int64), "cls_starts"),
+        numpy_helper.from_array(np.array(cls_ends, dtype=np.int64), "cls_ends"),
+        numpy_helper.from_array(np.array(axes, dtype=np.int64), "split_axes"),
+    ]
+    reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_shape)
+    cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_shape)
+
+    # 修改图：删原输出，加双输出 + 节点 + 初始化器
+    model.graph.output.remove(out_vi)
+    model.graph.output.extend([reg_vi, cls_vi])
+    model.graph.node.extend([reg_slice, cls_slice, reg_identity, cls_identity])
+    model.graph.initializer.extend(inits)
+
+    out_path = os.path.join(work_dir, "split_" + os.path.basename(onnx_path))
+    onnx.save(model, out_path)
+    return out_path, nc
+
+
 def export_npu_tflite(onnx_path: str, out_dir: str,
                       calibration: str = "random", num_samples: int = 8,
                       images_dir: Optional[str] = None,
@@ -309,6 +389,15 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
         # 0) onnxsim 预处理：仅当模型含 Constant 时才简化（绕过 onnx2tf 的 Constant bug）
         model_for_convert = preprocess_for_onnx2tf(onnx_path, tmp)
 
+        # 0.5) 双输出源头拆分：单输出 [1,C,N] → reg[1,4,N] + cls[1,Nc,N]
+        #   用 Slice+Identity 在 ONNX 图层面拆分（禁止 TFLiteConverter 的 Split），
+        #   让 cls 独立量化（scale≈1/256 满足 LOGISTIC 约束）。
+        #   参考 yezijinn/onnx_to_int8.tflite 项目设计。
+        model_for_convert, split_nc = split_merged_output(model_for_convert, tmp)
+        if split_nc is not None:
+            check["info"]["split_to_dual"] = True
+            check["info"]["num_classes"] = split_nc
+
         # 1) onnx2tf tf_converter 后端 → SavedModel（主要瓶颈，占 ~95% 耗时）
         with _tolerant_temp_cleanup():
             onnx2tf.convert(
@@ -316,6 +405,7 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
                 output_folder_path=tmp,
                 non_verbose=True,
                 tflite_backend="tf_converter",
+                batch_size=1,
             )
 
         sm_path = None
@@ -335,7 +425,11 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
                                  images_dir, tmp)
         converter = tf.lite.TFLiteConverter.from_saved_model(sm_path)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        # INT8 为主，SELECT_TF_OPS 兜底（部分算子需 TF ops fallback）
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+            tf.lite.OpsSet.SELECT_TF_OPS,
+        ]
         converter.inference_input_type = tf.int8
         converter.inference_output_type = tf.int8
         converter.representative_dataset = rep
