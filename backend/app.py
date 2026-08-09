@@ -309,6 +309,10 @@ def npu_export_api():
             original_name = rec.get("original_name") or rec.get("filename")
     calibration = data.get("calibration", "random")
     num_samples = int(data.get("num_samples", 8))
+    if calibration == "image":
+        from calibration import list_images
+        if not list_images(IMAGES_DIR):
+            return _err("已选择真实图片校准，但尚未上传校准图片（请先上传 50~200 张）", 400)
     try:
         res = npu_export.export_npu_tflite(
             path, EXPORTS_DIR, calibration=calibration,

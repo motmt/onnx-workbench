@@ -304,7 +304,7 @@
       </div>
       <div class="divider"></div>
       <p class="calib-label">INT8 量化校准方式</p>
-      <div class="calib-grid">
+      <div class="calib-grid" id="tfliteCalibGrid">
         <label class="calib-card" data-val="random">
           <input type="radio" name="calib" value="random" checked />
           <span class="radio"></span>
@@ -368,6 +368,34 @@
             导出 NPU TFLite
           </button>
         </div>
+      </div>
+      <div class="divider"></div>
+      <p class="calib-label">NPU INT8 量化校准方式</p>
+      <div class="calib-grid" id="npuCalibGrid">
+        <label class="calib-card" data-val="random">
+          <input type="radio" name="npuCalib" value="random" checked />
+          <span class="radio"></span>
+          <span>
+            <p class="name">随机数据</p>
+            <p class="desc">用随机张量校准，无需额外输入，速度快但精度一般</p>
+          </span>
+        </label>
+        <label class="calib-card recommended" data-val="image">
+          <input type="radio" name="npuCalib" value="image" />
+          <span class="radio"></span>
+          <span>
+            <p class="name">真实图片<span class="rec">推荐</span></p>
+            <p class="desc">用真实场景图片校准，激活分布更贴近实际，精度更好（建议 50~200 张）</p>
+          </span>
+        </label>
+      </div>
+      <div style="margin-top:12px">
+        <label class="file-label" style="border-color:#a7f3d0;background:#ecfdf5;color:var(--green-700)">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+          上传校准图片（用于 NPU 真实图片校准）
+          <input type="file" id="fileNpuImages" accept="image/*" multiple style="display:none" />
+        </label>
+        <span id="npuImgCount" style="font-size:12px;color:var(--text-2);margin-left:10px"></span>
       </div>
       <div class="npu-result" id="npuResult" style="display:none"></div>
     </div>
@@ -508,6 +536,28 @@ $('#fileImages').addEventListener('change', async (e)=>{
   toast('校准图片已上传', `${files.length} 张`, 'ok');
 });
 
+// ---------- NPU 校准（Step 4）----------
+$$('#npuCalibGrid .calib-card').forEach(c=>{
+  c.addEventListener('click',()=>{
+    $$('#npuCalibGrid .calib-card').forEach(x=>x.classList.remove('selected'));
+    c.classList.add('selected');
+    c.querySelector('input').checked = true;
+  });
+});
+document.querySelector('#npuCalibGrid .calib-card[data-val="random"]').classList.add('selected');
+
+let npuImgTotal = 0;  // 本次会话上传的校准图片总数（供导出前校验）
+$('#fileNpuImages').addEventListener('change', async (e)=>{
+  const files = [...e.target.files]; if(!files.length) return;
+  for(const f of files){
+    const fd = new FormData(); fd.append('file', f);
+    await fetch('/api/upload',{method:'POST',body:fd});
+  }
+  npuImgTotal += files.length;
+  $('#npuImgCount').textContent = `已上传 ${npuImgTotal} 张校准图片`;
+  toast('校准图片已上传', `${files.length} 张`, 'ok');
+});
+
 // ---------- 优化 / 量化 ----------
 async function runAction(endpoint, body, label){
   if(!currentModel){ toast('请先选择模型', '', 'warn'); return; }
@@ -582,15 +632,15 @@ window.downloadFile = function(path){
 };
 
 // ---------- TFLite 导出 ----------
-$$('.calib-card').forEach(c=>{
+$$('#tfliteCalibGrid .calib-card').forEach(c=>{
   c.addEventListener('click',()=>{
-    $$('.calib-card').forEach(x=>x.classList.remove('selected'));
+    $$('#tfliteCalibGrid .calib-card').forEach(x=>x.classList.remove('selected'));
     c.classList.add('selected');
     c.querySelector('input').checked = true;
   });
 });
 // 默认选中随机数据
-document.querySelector('.calib-card[data-val="random"]').classList.add('selected');
+document.querySelector('#tfliteCalibGrid .calib-card[data-val="random"]').classList.add('selected');
 
 $('#btnExportTflite').addEventListener('click', async ()=>{
   if(!currentModel){ toast('请先选择模型','','warn'); return; }
@@ -712,7 +762,13 @@ $('#btnNpuExport').addEventListener('click', async ()=>{
   }
   setStatus('NPU 导出中（全 INT8 量化）…','busy');
   $('#btnNpuExport').disabled = true;
-  const calib = document.querySelector('input[name=calib]:checked').value;
+  const calib = document.querySelector('input[name=npuCalib]:checked').value;
+  if(calib === 'image' && npuImgTotal === 0){
+    $('#btnNpuExport').disabled = false;
+    setStatus('就绪');
+    toast('请先上传校准图片','选择「真实图片」校准需先上传图片','warn');
+    return;
+  }
   const {json} = await API('/api/npu/export',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({model_id:currentModel.id, calibration:calib, num_samples:8})});
   if(json.ok){
