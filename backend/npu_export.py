@@ -26,6 +26,8 @@ from engine import _tolerant_temp_cleanup, preprocess_for_onnx2tf
 from calibration import list_images
 
 # QNN TFLite Delegate 已知不支持/高风险算子
+# 注：MatMul/BATCH_MATMUL 不拦截——valorant_256_v26n.tflite（含
+#     attention）实测在设备（TFLite+QNN NPU）上可用，attention 不是障碍
 _OP_BLACKLIST = {
     "TopK": "QNN delegate 不支持 TopK，需在后处理中做",
     "GatherElements": "QNN delegate 不支持 GatherElements",
@@ -37,12 +39,6 @@ _OP_BLACKLIST = {
     "Where": "QNN delegate 对 Where 支持有限",
     "If": "控制流算子不支持",
     "Loop": "控制流算子不支持",
-    "MatMul": "QNN delegate 不支持 BATCH_MATMUL（含 attention 机制的模型，"
-              "如 YOLOv6/YOLOv26s，会在设备上无法用 NPU 推理），"
-              "请换无 attention 的标准 YOLOv5/v8 结构",
-    "Gemm": "QNN delegate 不支持 BATCH_MATMUL（矩阵乘法，同 MatMul），"
-            "请换无 attention 的标准 YOLOv5/v8 结构",
-    "BatchMatMul": "QNN delegate 不支持 BATCH_MATMUL（attention 机制）",
 }
 
 # 输出候选数 NMS 后格式的特征（[1,300,6] 等）
@@ -520,34 +516,36 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
     nc = c_dim - 4
 
     def _emit(reg, cls, reg_shape, cls_shape, nc_out):
-        """在 reg/cls 分支末端加 Identity/Transpose 输出，统一 NC 布局。
+        """在 reg/cls 分支末端加 Identity/Transpose 输出，统一 CN 布局。
 
         - 输出名必须合法（不含 '/'），否则 onnx2tf 生成 TF op name 时
           报 "OP name does not match pattern"
         - Identity/Transpose 不改变量化传播：reg_out 传播自上游算术算子
           （像素大 scale 独立校准），cls_out 传播自 Sigmoid（0~1 → 1/256）
-        - 输出统一 NC 布局 [1,N,4]+[1,N,Nc]：与既有设备端契约
-          （wa黄色_npumotified.tflite）一致，CN 输入自动加 Transpose 转 NC
+        - 输出统一 CN 布局 [1,4,N]+[1,Nc,N]：与设备端实测可用契约一致
+          （val320_final_cn_2cls_xywh_direct_pure_int8.tflite 为
+           [1,4,2100]+[1,2,2100] CN 双输出；瓦v8-256/无畏_V11 为 CN 单输出）。
+          NC 输入自动加 Transpose 转 CN。
         """
         from onnx import TensorProto
         nodes = []
 
-        def _to_nc(src, shape, out_name, prefix):
-            if len(shape) == 3 and (shape[1] == 4 or 5 <= shape[1] <= 256):
-                # CN [1,C,N]（通道维在 dim1）-> NC [1,N,C]
+        def _to_cn(src, shape, out_name, prefix):
+            if len(shape) == 3 and (shape[2] == 4 or 5 <= shape[2] <= 256):
+                # NC [1,N,C]（通道维在 dim2）-> CN [1,C,N]
                 nodes.append(helper.make_node(
                     "Transpose", [src], [out_name], perm=[0, 2, 1],
                     name=prefix + "_t"))
                 return [shape[0], shape[2], shape[1]]
-            # 已是 NC
+            # 已是 CN
             nodes.append(helper.make_node(
                 "Identity", [src], [out_name], name=prefix + "_id"))
             return shape
 
-        reg_nc = _to_nc(reg, reg_shape, "reg_out", "src_reg")
-        cls_nc = _to_nc(cls, cls_shape, "cls_out", "src_cls")
-        reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_nc)
-        cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_nc)
+        reg_cn = _to_cn(reg, reg_shape, "reg_out", "src_reg")
+        cls_cn = _to_cn(cls, cls_shape, "cls_out", "src_cls")
+        reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_cn)
+        cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_cn)
         old_outputs = list(model.graph.output)
         while model.graph.output:
             model.graph.output.pop()
@@ -699,17 +697,17 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     from onnx import TensorProto, numpy_helper
 
     # Slice 参数（按通道维切分：前4=reg框，剩余=cls类别分数）
-    # 输出统一 NC 布局 [1,N,4]+[1,N,Nc]（与既有设备端契约一致）
+    # 输出统一 CN 布局 [1,4,N]+[1,Nc,N]（与设备端实测可用契约一致）
     if layout == "CN":
         reg_starts, reg_ends = [0, 0, 0], [1, 4, n_dim]
         cls_starts, cls_ends = [0, 4, 0], [1, c_dim, n_dim]
-        need_transpose = True
-        reg_shape, cls_shape = [1, n_dim, 4], [1, n_dim, nc]
+        need_transpose = False
+        reg_shape, cls_shape = [1, 4, n_dim], [1, nc, n_dim]
     else:
         reg_starts, reg_ends = [0, 0, 0], [1, n_dim, 4]
         cls_starts, cls_ends = [0, 0, 4], [1, n_dim, c_dim]
-        need_transpose = False
-        reg_shape, cls_shape = [1, n_dim, 4], [1, n_dim, nc]
+        need_transpose = True
+        reg_shape, cls_shape = [1, 4, n_dim], [1, nc, n_dim]
 
     axes = [0, 1, 2]
     # Slice 节点（opset 10+ 用输入而非属性）
@@ -726,7 +724,7 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     cls_identity = helper.make_node("Identity", ["cls_mid"], [cls_out_name], name="cls_identity")
     extra_nodes = [reg_slice, cls_slice, reg_identity, cls_identity]
     if need_transpose:
-        # CN -> NC：输出布局与设备端契约（wa黄色_npumotified）一致
+        # NC -> CN：输出布局与设备端契约（val320_final CN 双输出）一致
         extra_nodes.append(helper.make_node("Transpose", [reg_out_name], ["reg_out"],
                                             perm=[0, 2, 1], name="reg_transpose"))
         extra_nodes.append(helper.make_node("Transpose", [cls_out_name], ["cls_out"],
@@ -891,11 +889,21 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
 
 
 def _verify_int8(tflite_path: str) -> dict:
-    """检查 tflite 输入输出张量是否为 INT8，返回 {ok, detail}。"""
+    """检查 tflite 输入输出张量是否为 INT8，返回 {ok, detail}。
+
+    TF 的 file_io 打不开非 ASCII 路径（中文文件名），先拷贝到 ASCII 临时路径。
+    """
     detail = []
     try:
         import tensorflow as tf
-        interp = tf.lite.Interpreter(model_path=tflite_path)
+        check_path = tflite_path
+        is_ascii = all(ord(c) < 128 for c in tflite_path)
+        if not is_ascii:
+            tmp_ascii = os.path.join(
+                tempfile.gettempdir(), f"verify_{os.getpid()}.tflite")
+            shutil.copy(tflite_path, tmp_ascii)
+            check_path = tmp_ascii
+        interp = tf.lite.Interpreter(model_path=check_path)
         interp.allocate_tensors()
         ok = True
         for d in interp.get_input_details():
