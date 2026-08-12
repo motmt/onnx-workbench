@@ -275,8 +275,19 @@ def _build_rep_dataset(onnx_path: str, calibration: str,
     rng = np.random.default_rng(0)
     imgs = list_images(images_dir) if (calibration == "image" and images_dir) else []
 
+    # 图片校准：均匀抽样覆盖不同场景，避免只取排序前 N 张
+    # （前 N 张可能全是同场景/不含目标 → logits 量化范围偏窄，
+    #   部署时有目标图的正 logits 被 int8 截断，cls 封顶 0.5 识别不出）
+    # 样本数：图片模式自动用更多（校准耗时影响极小，实测 64 张 <1s）
+    n_iter = num_samples
+    if imgs:
+        n = min(num_samples * 4, len(imgs))
+        idx = np.linspace(0, len(imgs) - 1, n).astype(int)
+        imgs = [imgs[i] for i in idx]
+        n_iter = n
+
     def gen():
-        for i in range(num_samples):
+        for i in range(n_iter):
             if imgs:
                 img = PILImage.open(imgs[i % len(imgs)]).convert("RGB")
                 h, w = nhwc_shape[1], nhwc_shape[2]
