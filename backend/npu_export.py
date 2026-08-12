@@ -282,6 +282,10 @@ def _build_rep_dataset(onnx_path: str, calibration: str,
                 h, w = nhwc_shape[1], nhwc_shape[2]
                 img = img.resize((w, h), PILImage.BILINEAR)
                 arr = np.asarray(img, dtype=np.float32) / 255.0
+                # 图片是 [H,W,3]，必须补 batch 维为 [1,H,W,3]，
+                # 否则 TFLite 校准器把输入当 3D，PAD/Conv 等算子
+                # prepare 会因 paddings 维度 (4) 与输入 rank (3) 不匹配崩溃
+                arr = arr[np.newaxis, ...]
             else:
                 arr = rng.random(nhwc_shape, dtype=np.float32)
             yield [arr.astype(np.float32)]

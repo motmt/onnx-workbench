@@ -352,9 +352,9 @@
             <span class="pill off" id="npuPill">未检查</span>
           </div>
           <p class="tflite-desc" style="color:#334155">
-            按 <code>AI辅助瞄准</code> 逆向契约检查：输入 <b>INT8 NHWC [1,H,W,3]</b>、
+            按 <code>骁龙npu算子</code> 逆向契约检查：输入 <b>INT8 NHWC [1,H,W,3]</b>、
             输出 <b>[1,C,N] 或 [1,N,C]</b> anchor-free（C=4+类别数）、全 INT8、
-            不得内置 <code>TopK / GatherElements / NMS</code>。
+            基本实现全部内置 <code>TopK / GatherElements / NMS</code>的转换。
             合规 → 导出 NPU 专用 tflite；不合规 → 明确拒绝并列出原因。
           </p>
         </div>
@@ -778,8 +778,17 @@ $('#btnNpuExport').addEventListener('click', async ()=>{
     toast('请先上传校准图片','选择「真实图片」校准需先上传图片','warn');
     return;
   }
-  const {json} = await API('/api/npu/export',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({model_id:currentModel.id, calibration:calib, num_samples:8})});
+  let json;
+  try{
+    json = await API('/api/npu/export',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model_id:currentModel.id, calibration:calib, num_samples:8})});
+  }catch(e){
+    // 网络/服务异常：恢复按钮，避免一直卡在「导出中…」
+    $('#btnNpuExport').disabled = false;
+    setStatus('就绪');
+    toast('NPU 导出失败','后端无响应或已断开，请确认服务在运行','err',8000);
+    return;
+  }
   if(json.ok){
     const d = json.data;
     $('#npuResult').className = 'npu-result ok';
