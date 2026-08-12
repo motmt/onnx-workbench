@@ -37,6 +37,12 @@ _OP_BLACKLIST = {
     "Where": "QNN delegate 对 Where 支持有限",
     "If": "控制流算子不支持",
     "Loop": "控制流算子不支持",
+    "MatMul": "QNN delegate 不支持 BATCH_MATMUL（含 attention 机制的模型，"
+              "如 YOLOv6/YOLOv26s，会在设备上无法用 NPU 推理），"
+              "请换无 attention 的标准 YOLOv5/v8 结构",
+    "Gemm": "QNN delegate 不支持 BATCH_MATMUL（矩阵乘法，同 MatMul），"
+            "请换无 attention 的标准 YOLOv5/v8 结构",
+    "BatchMatMul": "QNN delegate 不支持 BATCH_MATMUL（attention 机制）",
 }
 
 # 输出候选数 NMS 后格式的特征（[1,300,6] 等）
