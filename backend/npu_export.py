@@ -751,6 +751,66 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     return out_path, nc
 
 
+def _convert_split_to_opset13(onnx_path: str, work_dir: str) -> str:
+    """把 Split 节点替换成等价的 Slice 序列（消除 SPLIT_V）。
+
+    关键：onnx2tf 对 Split 生成的 TF SPLIT_V 算子 QNN TFLite Delegate 不认，
+    设备上模型无法工作（实测：7-wa 转出 SPLIT_V×9 设备识别不了；
+    瓦v8 转出 SPLIT_V=0 设备正常）。Slize 会由 onnx2tf 转成
+    StridedSlice（QNN 支持）。
+
+    实现：每个 Split(data, axis, splits=[s1,s2,...]) →
+    N 个 Slice(data, [start], [start+size], [axis])，start 依次累加。
+    """
+    import numpy as np
+    from onnx import numpy_helper
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    init_map = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+
+    new_nodes = []
+    new_inits = []
+    changed = False
+    for i, node in enumerate(model.graph.node):
+        if node.op_type != "Split":
+            new_nodes.append(node)
+            continue
+        axis = next((a.i for a in node.attribute if a.name == "axis"), 0)
+        sizes = None
+        attr = next((a for a in node.attribute if a.name == "split"), None)
+        if attr is not None and attr.ints:
+            sizes = list(attr.ints)
+        elif len(node.input) >= 2 and node.input[1] in init_map:
+            sizes = list(init_map[node.input[1]])
+        if not sizes or len(node.output) != len(sizes):
+            new_nodes.append(node)
+            continue
+        start = 0
+        for k, (out_name, sz) in enumerate(zip(node.output, sizes)):
+            s_name = f"split_sl_st_{i}_{k}"
+            e_name = f"split_sl_en_{i}_{k}"
+            a_name = f"split_sl_ax_{i}_{k}"
+            new_inits.append(numpy_helper.from_array(
+                np.array([start], dtype=np.int64), s_name))
+            new_inits.append(numpy_helper.from_array(
+                np.array([start + sz], dtype=np.int64), e_name))
+            new_inits.append(numpy_helper.from_array(
+                np.array([axis], dtype=np.int64), a_name))
+            new_nodes.append(helper.make_node(
+                "Slice", [node.input[0], s_name, e_name, a_name],
+                [out_name], name=f"split_as_slice_{i}_{k}"))
+            start += sz
+        changed = True
+    if not changed:
+        return onnx_path
+    del model.graph.node[:]
+    model.graph.node.extend(new_nodes)
+    model.graph.initializer.extend(new_inits)
+    out_path = os.path.join(work_dir, "no_split.onnx")
+    onnx.save(model, out_path)
+    return out_path
+
+
 def export_npu_tflite(onnx_path: str, out_dir: str,
                       calibration: str = "random", num_samples: int = 8,
                       images_dir: Optional[str] = None,
@@ -816,6 +876,10 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
         if split_nc is not None:
             check["info"]["split_to_dual"] = True
             check["info"]["num_classes"] = split_nc
+
+        # 0.8) Split 转双输入形式（opset 13+）：避免 onnx2tf 生成 SPLIT_V
+        #     （QNN TFLite Delegate 不认 SPLIT_V，设备上无法工作）
+        model_for_convert = _convert_split_to_opset13(model_for_convert, tmp)
 
         # 1) onnx2tf tf_converter 后端 → SavedModel（主要瓶颈，占 ~95% 耗时）
         with _tolerant_temp_cleanup():
