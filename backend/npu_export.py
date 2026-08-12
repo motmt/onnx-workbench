@@ -514,30 +514,46 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
     nc = c_dim - 4
 
     def _emit(reg, cls, reg_shape, cls_shape, nc_out):
-        """在 reg/cls 分支末端加 Identity 改名输出（reg_out/cls_out）。
+        """在 reg/cls 分支末端加 Identity/Transpose 输出，统一 NC 布局。
 
         - 输出名必须合法（不含 '/'），否则 onnx2tf 生成 TF op name 时
           报 "OP name does not match pattern"
-        - Identity 不改变量化传播：reg_out 传播自上游算术算子（像素大 scale
-          独立校准），cls_out 传播自 Sigmoid（输出 [0,1] → scale=1/256）
+        - Identity/Transpose 不改变量化传播：reg_out 传播自上游算术算子
+          （像素大 scale 独立校准），cls_out 传播自 Sigmoid（0~1 → 1/256）
+        - 输出统一 NC 布局 [1,N,4]+[1,N,Nc]：与既有设备端契约
+          （wa黄色_npumotified.tflite）一致，CN 输入自动加 Transpose 转 NC
         """
         from onnx import TensorProto
-        reg_id = helper.make_node("Identity", [reg], ["reg_out"], name="src_split_reg")
-        cls_id = helper.make_node("Identity", [cls], ["cls_out"], name="src_split_cls")
-        reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_shape)
-        cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_shape)
+        nodes = []
+
+        def _to_nc(src, shape, out_name, prefix):
+            if len(shape) == 3 and (shape[1] == 4 or 5 <= shape[1] <= 256):
+                # CN [1,C,N]（通道维在 dim1）-> NC [1,N,C]
+                nodes.append(helper.make_node(
+                    "Transpose", [src], [out_name], perm=[0, 2, 1],
+                    name=prefix + "_t"))
+                return [shape[0], shape[2], shape[1]]
+            # 已是 NC
+            nodes.append(helper.make_node(
+                "Identity", [src], [out_name], name=prefix + "_id"))
+            return shape
+
+        reg_nc = _to_nc(reg, reg_shape, "reg_out", "src_reg")
+        cls_nc = _to_nc(cls, cls_shape, "cls_out", "src_cls")
+        reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_nc)
+        cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_nc)
         old_outputs = list(model.graph.output)
         while model.graph.output:
             model.graph.output.pop()
         model.graph.output.extend([reg_vi, cls_vi])
-        model.graph.node.extend([reg_id, cls_id])
+        model.graph.node.extend(nodes)
         out_path = os.path.join(work_dir, "split_src.onnx")
         try:
             onnx.save(model, out_path)
         except Exception:
             # 保存失败：恢复原输出和节点，回退 Slice 方案
-            model.graph.node.remove(reg_id)
-            model.graph.node.remove(cls_id)
+            for nd in nodes:
+                model.graph.node.remove(nd)
             while model.graph.output:
                 model.graph.output.pop()
             model.graph.output.extend(old_outputs)
@@ -677,13 +693,16 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     from onnx import TensorProto, numpy_helper
 
     # Slice 参数（按通道维切分：前4=reg框，剩余=cls类别分数）
+    # 输出统一 NC 布局 [1,N,4]+[1,N,Nc]（与既有设备端契约一致）
     if layout == "CN":
         reg_starts, reg_ends = [0, 0, 0], [1, 4, n_dim]
         cls_starts, cls_ends = [0, 4, 0], [1, c_dim, n_dim]
-        reg_shape, cls_shape = [1, 4, n_dim], [1, nc, n_dim]
+        need_transpose = True
+        reg_shape, cls_shape = [1, n_dim, 4], [1, n_dim, nc]
     else:
         reg_starts, reg_ends = [0, 0, 0], [1, n_dim, 4]
         cls_starts, cls_ends = [0, 0, 4], [1, n_dim, c_dim]
+        need_transpose = False
         reg_shape, cls_shape = [1, n_dim, 4], [1, n_dim, nc]
 
     axes = [0, 1, 2]
@@ -695,8 +714,17 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
         inputs=[out_name, "cls_starts", "cls_ends", "split_axes"],
         outputs=["cls_mid"], name="split_cls")
     # Identity 节点（创建独立输出张量，确保 TFLiteConverter 独立量化）
-    reg_identity = helper.make_node("Identity", ["reg_mid"], ["reg_out"], name="reg_identity")
-    cls_identity = helper.make_node("Identity", ["cls_mid"], ["cls_out"], name="cls_identity")
+    reg_out_name = "reg_out_tmp" if need_transpose else "reg_out"
+    cls_out_name = "cls_out_tmp" if need_transpose else "cls_out"
+    reg_identity = helper.make_node("Identity", ["reg_mid"], [reg_out_name], name="reg_identity")
+    cls_identity = helper.make_node("Identity", ["cls_mid"], [cls_out_name], name="cls_identity")
+    extra_nodes = [reg_slice, cls_slice, reg_identity, cls_identity]
+    if need_transpose:
+        # CN -> NC：输出布局与设备端契约（wa黄色_npumotified）一致
+        extra_nodes.append(helper.make_node("Transpose", [reg_out_name], ["reg_out"],
+                                            perm=[0, 2, 1], name="reg_transpose"))
+        extra_nodes.append(helper.make_node("Transpose", [cls_out_name], ["cls_out"],
+                                            perm=[0, 2, 1], name="cls_transpose"))
 
     inits = [
         numpy_helper.from_array(np.array(reg_starts, dtype=np.int64), "reg_starts"),
@@ -711,7 +739,7 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     # 修改图：删原输出，加双输出 + 节点 + 初始化器
     model.graph.output.remove(out_vi)
     model.graph.output.extend([reg_vi, cls_vi])
-    model.graph.node.extend([reg_slice, cls_slice, reg_identity, cls_identity])
+    model.graph.node.extend(extra_nodes)
     model.graph.initializer.extend(inits)
 
     out_path = os.path.join(work_dir, "split_" + os.path.basename(onnx_path))
