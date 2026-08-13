@@ -522,10 +522,11 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
           报 "OP name does not match pattern"
         - Identity/Transpose 不改变量化传播：reg_out 传播自上游算术算子
           （像素大 scale 独立校准），cls_out 传播自 Sigmoid（0~1 → 1/256）
-        - 输出统一 CN 布局 [1,4,N]+[1,Nc,N]：与设备端实测可用契约一致
-          （val320_final_cn_2cls_xywh_direct_pure_int8.tflite 为
-           [1,4,2100]+[1,2,2100] CN 双输出；瓦v8-256/无畏_V11 为 CN 单输出）。
-          NC 输入自动加 Transpose 转 CN。
+        - 输出统一 CN 布局 [1,Nc,N]+[1,4,N]，且【cls 分数在前、reg 框在后】
+          （score_first 顺序）：设备端软件按输出 index 顺序解析，OUT[0] 必须是
+          分数、OUT[1] 才是框。实测 val320_final（可用）OUT[0]=cls[1,2,2100]
+          OUT[1]=reg[1,4,2100]；此前 7-wa 输出 reg 在前导致设备把框当分数读、
+          一次都识别不出。NC 输入自动加 Transpose 转 CN。
         """
         from onnx import TensorProto
         nodes = []
@@ -542,13 +543,17 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
                 "Identity", [src], [out_name], name=prefix + "_id"))
             return shape
 
-        reg_cn = _to_cn(reg, reg_shape, "reg_out", "src_reg")
-        cls_cn = _to_cn(cls, cls_shape, "cls_out", "src_cls")
-        reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_cn)
-        cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_cn)
+        reg_cn = _to_cn(reg, reg_shape, "app_boxes", "src_reg")
+        cls_cn = _to_cn(cls, cls_shape, "app_scores", "src_cls")
+        reg_vi = helper.make_tensor_value_info("app_boxes", TensorProto.FLOAT, reg_cn)
+        cls_vi = helper.make_tensor_value_info("app_scores", TensorProto.FLOAT, cls_cn)
         old_outputs = list(model.graph.output)
         while model.graph.output:
             model.graph.output.pop()
+        # score_first 输出顺序：设备端按 TFLite 输出 index 解析（OUT[0]=分数）。
+        # 机制：onnx2tf concrete function 输出顺序 = ONNX graph.output 顺序，
+        # 但 TFLiteConverter 会【倒序】输出（PartitionedCall:1 在前 :0 在后）。
+        # 故要 TFLite OUT[0]=cls，需 ONNX 里 cls 排在【最后】→ 这里 reg 在前 cls 在后。
         model.graph.output.extend([reg_vi, cls_vi])
         model.graph.node.extend(nodes)
         out_path = os.path.join(work_dir, "split_src.onnx")
@@ -718,16 +723,18 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
         inputs=[out_name, "cls_starts", "cls_ends", "split_axes"],
         outputs=["cls_mid"], name="split_cls")
     # Identity 节点（创建独立输出张量，确保 TFLiteConverter 独立量化）
-    reg_out_name = "reg_out_tmp" if need_transpose else "reg_out"
-    cls_out_name = "cls_out_tmp" if need_transpose else "cls_out"
+    # 输出名 app_boxes(框) < app_scores(分数)：onnx2tf 按名字排序 concrete 输出，
+    # TFLiteConverter 倒序后 app_scores(分数) 排 OUT[0]（设备端按 index 解析）
+    reg_out_name = "app_boxes_tmp" if need_transpose else "app_boxes"
+    cls_out_name = "app_scores_tmp" if need_transpose else "app_scores"
     reg_identity = helper.make_node("Identity", ["reg_mid"], [reg_out_name], name="reg_identity")
     cls_identity = helper.make_node("Identity", ["cls_mid"], [cls_out_name], name="cls_identity")
     extra_nodes = [reg_slice, cls_slice, reg_identity, cls_identity]
     if need_transpose:
         # NC -> CN：输出布局与设备端契约（val320_final CN 双输出）一致
-        extra_nodes.append(helper.make_node("Transpose", [reg_out_name], ["reg_out"],
+        extra_nodes.append(helper.make_node("Transpose", [reg_out_name], ["app_boxes"],
                                             perm=[0, 2, 1], name="reg_transpose"))
-        extra_nodes.append(helper.make_node("Transpose", [cls_out_name], ["cls_out"],
+        extra_nodes.append(helper.make_node("Transpose", [cls_out_name], ["app_scores"],
                                             perm=[0, 2, 1], name="cls_transpose"))
 
     inits = [
@@ -737,10 +744,11 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
         numpy_helper.from_array(np.array(cls_ends, dtype=np.int64), "cls_ends"),
         numpy_helper.from_array(np.array(axes, dtype=np.int64), "split_axes"),
     ]
-    reg_vi = helper.make_tensor_value_info("reg_out", TensorProto.FLOAT, reg_shape)
-    cls_vi = helper.make_tensor_value_info("cls_out", TensorProto.FLOAT, cls_shape)
+    reg_vi = helper.make_tensor_value_info("app_boxes", TensorProto.FLOAT, reg_shape)
+    cls_vi = helper.make_tensor_value_info("app_scores", TensorProto.FLOAT, cls_shape)
 
     # 修改图：删原输出，加双输出 + 节点 + 初始化器
+    # score_first：cls（分数）在 ONNX 最后 → TFLiteConverter 倒序后 OUT[0]=cls
     model.graph.output.remove(out_vi)
     model.graph.output.extend([reg_vi, cls_vi])
     model.graph.node.extend(extra_nodes)
@@ -922,6 +930,10 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
         with open(out_path, "wb") as f:
             f.write(tflite_model)
 
+        # 3.5) 输出顺序校正：设备端按 index 解析（OUT[0]=分数），
+        #       onnx2tf 会把 reg 排 OUT[0]，这里重排成 score_first
+        _reorder_score_first(out_path)
+
         # 3) 验证输入输出确实是 int8
         verify_detail = _verify_int8(out_path)
         if not verify_detail["ok"]:
@@ -950,6 +962,87 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
     finally:
         with _tolerant_temp_cleanup():
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _swap_flatbuffer_outputs(tflite_path: str) -> bool:
+    """交换 TFLite flatbuffer 里 subgraph[0].outputs 前两个 tensor index。
+
+    onnx2tf + TFLiteConverter 会固定把 reg（框）排在 OUT[0]、cls（分数）
+    排在 OUT[1]，与 ONNX graph.output 顺序、输出张量名都无关（TFLiteConverter
+    按内部 tensor index 排序）。设备端软件按输出 index 解析（OUT[0]=分数），
+    读反导致"模型能加载但识别不出"。这里直接字节级交换 subgraph.outputs，
+    不改变任何张量内容，模型仍可正常加载推理。
+    """
+    try:
+        import flatbuffers
+        from flatbuffers import encode, number_types as N
+    except Exception:
+        return False
+    try:
+        with open(tflite_path, "rb") as f:
+            buf = bytearray(f.read())
+        # flatbuffer 布局（已验证）：root table offset 在文件头 4 字节；
+        # Model.subgraphs(field2) → vector of SubGraph；SubGraph.outputs(field2)
+        # → vector of int32（tensor index）。
+        root = encode.Get(N.UOffsetTFlags.packer_type, buf, 0)
+        vt = root - encode.Get(N.SOffsetTFlags.packer_type, buf, root)
+        # Model.subgraphs (field index 2 → vtable offset = 4 + 2*2)
+        subg_voff = encode.Get(N.VOffsetTFlags.packer_type, buf, vt + 8)
+        subg_vec_pos = root + subg_voff + encode.Get(
+            N.UOffsetTFlags.packer_type, buf, root + subg_voff)
+        subg_len = encode.Get(N.UOffsetTFlags.packer_type, buf, subg_vec_pos)
+        if subg_len < 1:
+            return False
+        # SubGraph[0]
+        sg_pos = subg_vec_pos + 4 + encode.Get(
+            N.UOffsetTFlags.packer_type, buf, subg_vec_pos + 4)
+        # SubGraph.outputs (field index 2 → vtable offset = 4 + 2*2)
+        sg_vt = sg_pos - encode.Get(N.SOffsetTFlags.packer_type, buf, sg_pos)
+        out_voff = encode.Get(N.VOffsetTFlags.packer_type, buf, sg_vt + 8)
+        out_vec_pos = sg_pos + out_voff + encode.Get(
+            N.UOffsetTFlags.packer_type, buf, sg_pos + out_voff)
+        out_len = encode.Get(N.UOffsetTFlags.packer_type, buf, out_vec_pos)
+        if out_len < 2:
+            return False
+        a = encode.Get(N.Int32Flags.packer_type, buf, out_vec_pos + 4)
+        b = encode.Get(N.Int32Flags.packer_type, buf, out_vec_pos + 8)
+        encode.Write(N.Int32Flags.packer_type, buf, out_vec_pos + 4, b)
+        encode.Write(N.Int32Flags.packer_type, buf, out_vec_pos + 8, a)
+        with open(tflite_path, "wb") as f:
+            f.write(bytes(buf))
+        return True
+    except Exception:
+        return False
+
+
+def _reorder_score_first(tflite_path: str) -> bool:
+    """把 TFLite 输出调整为 score_first（OUT[0]=cls 分数，OUT[1]=reg 框）。
+
+    判断依据：cls 是 Sigmoid 输出 [0,1]，量化 scale≈1/256（<0.1）；
+    reg 是像素坐标（decode 后），scale 大（≥0.1）。若 OUT[0] 是 reg 则交换。
+    返回是否执行了交换。
+    """
+    import tensorflow as tf
+    check_path = tflite_path
+    is_ascii = all(ord(c) < 128 for c in tflite_path)
+    if not is_ascii:
+        check_path = os.path.join(
+            tempfile.gettempdir(), f"reorder_{os.getpid()}.tflite")
+        shutil.copy(tflite_path, check_path)
+    try:
+        interp = tf.lite.Interpreter(model_path=check_path)
+        interp.allocate_tensors()
+        outs = interp.get_output_details()
+        if len(outs) < 2:
+            return False
+        s0 = outs[0]["quantization"][0]
+        s1 = outs[1]["quantization"][0]
+        # OUT[0] 已是 cls（scale 小）则无需交换
+        if not (s0 >= 0.1 and s1 < 0.1):
+            return False
+    except Exception:
+        return False
+    return _swap_flatbuffer_outputs(tflite_path)
 
 
 def _verify_int8(tflite_path: str) -> dict:
