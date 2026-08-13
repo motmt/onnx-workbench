@@ -543,7 +543,13 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
                 "Identity", [src], [out_name], name=prefix + "_id"))
             return shape
 
-        reg_cn = _to_cn(reg, reg_shape, "app_boxes", "src_reg")
+        # reg 去负值（Relu）：像素坐标含负值（框中心偏出图像）会导致非对称量化
+        # zp=-93，而 QNN 对 CN 布局 reg 输出要求对称量化（实测：瓦v8/val320 可用
+        # 的 reg zp=-127 对称，7-wa 的 reg 有负值 -52 → zp=-93 非对称 → 设备完全没框）。
+        # Relu 让 reg≥0 → zp 变对称 -128，且不破坏 cls 独立量化（reg/cls 是独立分支）。
+        relu = helper.make_node("Relu", [reg], ["reg_nonneg"], name="src_reg_relu")
+        nodes.append(relu)
+        reg_cn = _to_cn("reg_nonneg", reg_shape, "app_boxes", "src_reg")
         cls_cn = _to_cn(cls, cls_shape, "app_scores", "src_cls")
         reg_vi = helper.make_tensor_value_info("app_boxes", TensorProto.FLOAT, reg_cn)
         cls_vi = helper.make_tensor_value_info("app_scores", TensorProto.FLOAT, cls_cn)
