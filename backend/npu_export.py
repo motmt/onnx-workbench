@@ -876,6 +876,16 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
                 raise RuntimeError("end2end NMS 检测头还原失败，无法继续导出")
             check["info"]["recover_info"] = rec_info
 
+        # 0.4) 输入颜色顺序检测 + 反转：设备端（libaiassistance.so）用 OpenCV
+        #     BGR 喂图，而 ultralytics 训练的模型输入是 RGB。红蓝通道颠倒会
+        #     导致识别不出。用校准图对比 RGB/BGR 的 cls 分数，模型期望 RGB
+        #     时给输入加 Gather 通道反转（BGR 喂入等效 RGB）。
+        color_order = _detect_color_order(model_for_convert, images_dir)
+        check["info"]["input_color_order"] = color_order
+        if color_order == "RGB":
+            model_for_convert = _reverse_input_channel(model_for_convert, tmp)
+            check["info"]["input_color_reversed"] = True
+
         # 0.5) 双输出源头拆分：单输出 [1,C,N] → reg[1,4,N] + cls[1,Nc,N]
         #   用 Slice+Identity 在 ONNX 图层面拆分（禁止 TFLiteConverter 的 Split），
         #   让 cls 独立量化（scale≈1/256 满足 LOGISTIC 约束）。
@@ -962,6 +972,89 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
     finally:
         with _tolerant_temp_cleanup():
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _reverse_input_channel(onnx_path: str, work_dir: str) -> str:
+    """给模型输入加 RGB→BGR 通道反转（Gather axis=1 indices=[2,1,0]）。
+
+    设备端（libaiassistance.so）用 OpenCV 喂图，颜色是 BGR；而 ultralytics
+    训练的模型输入是 RGB。红蓝通道颠倒会导致目标特征错乱 → 识别不出。
+    加一个 Gather 反转输入通道，让设备端 BGR 喂入等效于模型期望的 RGB。
+    """
+    import numpy as np
+    from onnx import numpy_helper
+    model = onnx.load(onnx_path, load_external_data=False)
+    inp_name = model.graph.input[0].name
+    idx = numpy_helper.from_array(np.array([2, 1, 0], dtype=np.int64), "rev_idx")
+    gather = helper.make_node(
+        "Gather", [inp_name, "rev_idx"], ["input_rev"], axis=1,
+        name="input_reverse_channel")
+    model.graph.initializer.append(idx)
+    model.graph.node.insert(0, gather)
+    for n in model.graph.node[1:]:
+        for i, name in enumerate(n.input):
+            if name == inp_name:
+                n.input[i] = "input_rev"
+    out_path = os.path.join(work_dir, "channel_reversed.onnx")
+    onnx.save(model, out_path)
+    return out_path
+
+
+def _detect_color_order(onnx_path: str, images_dir: str) -> str:
+    """检测模型期望的输入颜色顺序，返回 'RGB' 或 'BGR'。
+
+    用校准图对比 RGB vs BGR 喂入时的 cls 分数：哪个颜色顺序的 cls 分数
+    整体更高，模型就期望哪个顺序。设备端固定喂 BGR，若模型期望 RGB 则
+    需要加通道反转（_reverse_input_channel）。返回 'RGB' 表示需反转。
+    """
+    import onnxruntime as ort
+    from PIL import Image as PILImage
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    try:
+        sess = ort.InferenceSession(onnx_path, so, providers=["CPUExecutionProvider"])
+    except Exception:
+        return "RGB"
+    inp = sess.get_inputs()[0]
+    if len(inp.shape) != 4 or inp.shape[1] != 3:
+        return "RGB"
+    h, w = inp.shape[2], inp.shape[3]
+    imgs = list_images(images_dir) if images_dir else []
+    rgb_win = bgr_win = 0
+    n = 0
+    for img_path in imgs[:24]:
+        try:
+            img = PILImage.open(img_path).convert("RGB").resize((w, h), PILImage.BILINEAR)
+            rgb = np.asarray(img, dtype=np.float32) / 255.0
+            bgr = rgb[:, :, ::-1].copy()
+
+            def cls_of(arr):
+                x = arr.transpose(2, 0, 1)[None].astype(np.float32)
+                outs = sess.run(None, {inp.name: x})
+                o = outs[0]
+                if o.ndim == 3:
+                    if o.shape[-1] > 4:        # NC [1,N,C]
+                        cls = o[:, :, 4:]
+                    elif o.shape[1] > 4:       # CN [1,C,N]
+                        cls = o[:, 4:, :]
+                    else:
+                        cls = o
+                else:
+                    cls = o
+                return float(cls.max())
+
+            r = cls_of(rgb)
+            b = cls_of(bgr)
+            if abs(r - b) < 1e-3:
+                continue
+            rgb_win += r > b
+            bgr_win += b > r
+            n += 1
+        except Exception:
+            continue
+    if n == 0:
+        return "RGB"
+    return "RGB" if rgb_win >= bgr_win else "BGR"
 
 
 def _swap_flatbuffer_outputs(tflite_path: str) -> bool:
