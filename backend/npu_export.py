@@ -543,15 +543,69 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
                 "Identity", [src], [out_name], name=prefix + "_id"))
             return shape
 
-        # reg 去负值（Relu）：像素坐标含负值（框中心偏出图像）会导致非对称量化
-        # zp=-93，而 QNN 对 CN 布局 reg 输出要求对称量化（实测：瓦v8/val320 可用
-        # 的 reg zp=-127 对称，7-wa 的 reg 有负值 -52 → zp=-93 非对称 → 设备完全没框）。
-        # Relu 让 reg≥0 → zp 变对称 -128，且不破坏 cls 独立量化（reg/cls 是独立分支）。
-        relu = helper.make_node("Relu", [reg], ["reg_nonneg"], name="src_reg_relu")
-        nodes.append(relu)
-        reg_cn = _to_cn("reg_nonneg", reg_shape, "app_boxes", "src_reg")
+        # xyxy → cxcywh 坐标换算：设备端（霜雪 APP）按 cxcywh（中心宽高）解析框，
+        # 但 7-wa 这类 TRT 模型的 reg 是 xyxy（x1,y1,x2,y2，x1/y1 左上角可为负）。
+        # 参考 yezijinn/onnx_to_QNNHTP.tflite_model：end2end 还原时做
+        # [x1,y1,x2,y2]→[cx,cy,w,h] 换算。不换算则设备端把 xyxy 当 cxcywh 读 → 完全没框。
+        import numpy as _np
+        from onnx import numpy_helper as _nh
+
+        def _is_xyxy(name):
+            """检测 reg 分支是否是 xyxy decode（Sub(anchor,x) + Add(anchor,x) 共用同一 anchor）。"""
+            cur = name
+            for _ in range(4):
+                if cur not in producer:
+                    return False
+                n = model.graph.node[producer[cur]]
+                if n.op_type == "Concat":
+                    subs, adds = set(), set()
+                    for inp in n.input:
+                        if inp in producer:
+                            pn = model.graph.node[producer[inp]]
+                            if pn.op_type in ("Sub", "Add") and pn.input:
+                                (subs if pn.op_type == "Sub" else adds).add(pn.input[0])
+                    return bool(subs & adds)
+                if n.op_type in ("Mul", "Transpose", "Reshape", "Identity",
+                                 "Squeeze", "Unsqueeze"):
+                    cur = n.input[0] if n.input else ""
+                else:
+                    return False
+            return False
+
+        def _xyxy_to_cxcywh(src, n_dim, nodes, inits):
+            """xyxy [1,4,N] → cxcywh [1,4,N]（cx=(x1+x2)/2, cy=(y1+y2)/2, w=x2-x1, h=y2-y1）。"""
+            inits.append(_nh.from_array(_np.array([0, 1, 2], _np.int64), "xyxy_ax"))
+            inits.append(_nh.from_array(_np.array(2.0, _np.float32), "xyxy_two"))
+            for i, nm in enumerate(["x1", "y1", "x2", "y2"]):
+                s, e = f"{nm}_s", f"{nm}_e"
+                inits.append(_nh.from_array(_np.array([0, i, 0], _np.int64), s))
+                inits.append(_nh.from_array(_np.array([1, i + 1, n_dim], _np.int64), e))
+                nodes.append(helper.make_node(
+                    "Slice", [src, s, e, "xyxy_ax"], [f"reg_{nm}"], name=f"sl_{nm}"))
+            nodes.append(helper.make_node("Add", ["reg_x1", "reg_x2"], ["cx_sum"], name="cx_sum"))
+            nodes.append(helper.make_node("Add", ["reg_y1", "reg_y2"], ["cy_sum"], name="cy_sum"))
+            nodes.append(helper.make_node("Sub", ["reg_x2", "reg_x1"], ["reg_w"], name="reg_w"))
+            nodes.append(helper.make_node("Sub", ["reg_y2", "reg_y1"], ["reg_h"], name="reg_h"))
+            nodes.append(helper.make_node("Div", ["cx_sum", "xyxy_two"], ["reg_cx"], name="reg_cx"))
+            nodes.append(helper.make_node("Div", ["cy_sum", "xyxy_two"], ["reg_cy"], name="reg_cy"))
+            nodes.append(helper.make_node(
+                "Concat", ["reg_cx", "reg_cy", "reg_w", "reg_h"], ["reg_cxcywh"],
+                axis=1, name="cxcywh_concat"))
+            # 去剩余负值（边缘框中心偏出图像），保证量化 zp 对称
+            nodes.append(helper.make_node(
+                "Relu", ["reg_cxcywh"], ["reg_cxcywh_nonneg"], name="cxcywh_relu"))
+            return "reg_cxcywh_nonneg"
+
+        inits = []
+        # reg 先统一转 CN，再按需做 xyxy→cxcywh 换算
+        reg_cn_shape = _to_cn(reg, reg_shape, "reg_cn_mid", "src_reg")
+        if _is_xyxy(reg):
+            reg_final = _xyxy_to_cxcywh("reg_cn_mid", reg_cn_shape[2], nodes, inits)
+        else:
+            reg_final = "reg_cn_mid"
+        nodes.append(helper.make_node("Identity", [reg_final], ["app_boxes"], name="reg_final_id"))
         cls_cn = _to_cn(cls, cls_shape, "app_scores", "src_cls")
-        reg_vi = helper.make_tensor_value_info("app_boxes", TensorProto.FLOAT, reg_cn)
+        reg_vi = helper.make_tensor_value_info("app_boxes", TensorProto.FLOAT, reg_cn_shape)
         cls_vi = helper.make_tensor_value_info("app_scores", TensorProto.FLOAT, cls_cn)
         old_outputs = list(model.graph.output)
         while model.graph.output:
@@ -562,6 +616,8 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
         # 故要 TFLite OUT[0]=cls，需 ONNX 里 cls 排在【最后】→ 这里 reg 在前 cls 在后。
         model.graph.output.extend([reg_vi, cls_vi])
         model.graph.node.extend(nodes)
+        if inits:
+            model.graph.initializer.extend(inits)
         out_path = os.path.join(work_dir, "split_src.onnx")
         try:
             onnx.save(model, out_path)
@@ -569,6 +625,9 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
             # 保存失败：恢复原输出和节点，回退 Slice 方案
             for nd in nodes:
                 model.graph.node.remove(nd)
+            for it in inits:
+                if it in model.graph.initializer:
+                    model.graph.initializer.remove(it)
             while model.graph.output:
                 model.graph.output.pop()
             model.graph.output.extend(old_outputs)
