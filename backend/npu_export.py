@@ -591,10 +591,10 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
             nodes.append(helper.make_node(
                 "Concat", ["reg_cx", "reg_cy", "reg_w", "reg_h"], ["reg_cxcywh"],
                 axis=1, name="cxcywh_concat"))
-            # 去剩余负值（边缘框中心偏出图像），保证量化 zp 对称
-            nodes.append(helper.make_node(
-                "Relu", ["reg_cxcywh"], ["reg_cxcywh_nonneg"], name="cxcywh_relu"))
-            return "reg_cxcywh_nonneg"
+            # 不加 Relu：cxcywh 语义恒正（cx/cy 是中心、w/h 是宽高），实测换算后
+            # 无负值。Relu 是额外算子，QNN delegate 可能不接受（实测含 Relu 的
+            # 模型 421/422 节点被 delegate → 2 partitions → 设备识别不出）。
+            return "reg_cxcywh"
 
         inits = []
         # reg 先统一转 CN，再按需做 xyxy→cxcywh 换算（仅霜雪版 convert_xyxy=True）
@@ -1063,23 +1063,40 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
 
 
 def _reverse_input_channel(onnx_path: str, work_dir: str) -> str:
-    """给模型输入加 RGB→BGR 通道反转（Gather axis=1 indices=[2,1,0]）。
+    """给模型输入加 RGB→BGR 通道反转（Slice+Concat，QNN 支持）。
 
     设备端（libaiassistance.so）用 OpenCV 喂图，颜色是 BGR；而 ultralytics
     训练的模型输入是 RGB。红蓝通道颠倒会导致目标特征错乱 → 识别不出。
-    加一个 Gather 反转输入通道，让设备端 BGR 喂入等效于模型期望的 RGB。
+
+    实现：Slice 分离 R/G/B 三个通道 + Concat 重组为 BGR（STRIDED_SLICE +
+    CONCATENATION 都是 QNN delegate 支持的算子）。不用 Gather(axis=1)：
+    QNN HTP 对 Gather 的 axis/indices 支持有限，实测含 Gather 的模型
+    422 节点里 1 个不被 delegate（421/422 → 2 partitions → 设备识别不出）。
     """
     import numpy as np
     from onnx import numpy_helper
     model = onnx.load(onnx_path, load_external_data=False)
     inp_name = model.graph.input[0].name
-    idx = numpy_helper.from_array(np.array([2, 1, 0], dtype=np.int64), "rev_idx")
-    gather = helper.make_node(
-        "Gather", [inp_name, "rev_idx"], ["input_rev"], axis=1,
-        name="input_reverse_channel")
-    model.graph.initializer.append(idx)
-    model.graph.node.insert(0, gather)
-    for n in model.graph.node[1:]:
+    inits = [
+        numpy_helper.from_array(np.array([1], dtype=np.int64), "rev_axes"),
+    ]
+    nodes = []
+    # 通道顺序：0=R, 1=G, 2=B（NCHW axis=1）
+    for i, nm in enumerate(["r", "g", "b"]):
+        s, e = f"rev_{nm}_s", f"rev_{nm}_e"
+        inits.append(numpy_helper.from_array(np.array([i], dtype=np.int64), s))
+        inits.append(numpy_helper.from_array(np.array([i + 1], dtype=np.int64), e))
+        nodes.append(helper.make_node(
+            "Slice", [inp_name, s, e, "rev_axes"], [f"rev_{nm}"],
+            name=f"rev_slice_{nm}"))
+    # Concat 成 [B, G, R]
+    nodes.append(helper.make_node(
+        "Concat", ["rev_b", "rev_g", "rev_r"], ["input_rev"],
+        axis=1, name="input_reverse_concat"))
+    model.graph.initializer.extend(inits)
+    for nd in reversed(nodes):
+        model.graph.node.insert(0, nd)
+    for n in model.graph.node[len(nodes):]:
         for i, name in enumerate(n.input):
             if name == inp_name:
                 n.input[i] = "input_rev"
