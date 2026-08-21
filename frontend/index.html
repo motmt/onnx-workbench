@@ -370,6 +370,25 @@
         </div>
       </div>
       <div class="divider"></div>
+      <p class="calib-label">导出目标版本</p>
+      <div class="calib-grid" id="npuTargetGrid">
+        <label class="calib-card selected" data-val="qnn">
+          <input type="radio" name="npuTarget" value="qnn" checked />
+          <span class="radio"></span>
+          <span>
+            <p class="name">骁龙 QNN 专属</p>
+            <p class="desc">通用 QNN 导出：双输出拆分 + 独立量化，保持模型原始坐标语义，适合常规 QNN 设备</p>
+          </span>
+        </label>
+        <label class="calib-card" data-val="snow">
+          <input type="radio" name="npuTarget" value="snow" />
+          <span class="radio"></span>
+          <span>
+            <p class="name">霜雪专用</p>
+            <p class="desc">霜雪 APP 契约：输入颜色反转 + reg 坐标换算(cxcywh) + score_first 顺序，产物带 _snow 后缀</p>
+          </span>
+        </label>
+      </div>
       <p class="calib-label">NPU INT8 量化校准方式</p>
       <div class="calib-grid" id="npuCalibGrid">
         <label class="calib-card" data-val="random">
@@ -554,6 +573,19 @@ $$('#npuCalibGrid .calib-card').forEach(c=>{
   });
 });
 document.querySelector('#npuCalibGrid .calib-card[data-val="random"]').classList.add('selected');
+
+// ---------- NPU 导出目标版本（QNN 通用 / 霜雪专用）----------
+$$('#npuTargetGrid .calib-card').forEach(c=>{
+  c.addEventListener('click',()=>{
+    $$('#npuTargetGrid .calib-card').forEach(x=>x.classList.remove('selected'));
+    c.classList.add('selected');
+    c.querySelector('input').checked = true;
+    // 霜雪版依赖真实图片（颜色顺序检测需要校准图），切换时给出提示
+    if(c.dataset.val === 'snow' && npuImgTotal === 0){
+      toast('霜雪版建议上传校准图','颜色顺序检测需用真实图片，未上传时按 RGB 假设处理','warn',6000);
+    }
+  });
+});
 
 let npuImgTotal = 0;  // 本次会话上传的校准图片总数（供导出前校验）
 $('#fileNpuImages').addEventListener('change', async (e)=>{
@@ -772,6 +804,7 @@ $('#btnNpuExport').addEventListener('click', async ()=>{
   setStatus('NPU 导出中（全 INT8 量化）…','busy');
   $('#btnNpuExport').disabled = true;
   const calib = document.querySelector('input[name=npuCalib]:checked').value;
+  const target = document.querySelector('input[name=npuTarget]:checked').value;
   if(calib === 'image' && npuImgTotal === 0){
     $('#btnNpuExport').disabled = false;
     setStatus('就绪');
@@ -781,7 +814,7 @@ $('#btnNpuExport').addEventListener('click', async ()=>{
   let json;
   try{
     json = await API('/api/npu/export',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model_id:currentModel.id, calibration:calib, num_samples:8})});
+      body:JSON.stringify({model_id:currentModel.id, calibration:calib, num_samples:8, target:target})});
   }catch(e){
     // 网络/服务异常：恢复按钮，避免一直卡在「导出中…」
     $('#btnNpuExport').disabled = false;

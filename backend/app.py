@@ -399,6 +399,9 @@ def npu_export_api():
             original_name = rec.get("original_name") or rec.get("filename")
     calibration = data.get("calibration", "random")
     num_samples = int(data.get("num_samples", 8))
+    target = data.get("target", "qnn")
+    if target not in ("qnn", "snow"):
+        return _err("target 参数无效（应为 qnn 通用版 或 snow 霜雪版）", 400)
     if calibration == "image":
         from calibration import list_images
         if not list_images(IMAGES_DIR):
@@ -407,7 +410,7 @@ def npu_export_api():
         res = npu_export.export_npu_tflite(
             path, EXPORTS_DIR, calibration=calibration,
             num_samples=num_samples, images_dir=IMAGES_DIR,
-            original_name=original_name,
+            original_name=original_name, target=target,
         )
         return _ok(res)
     except RuntimeError as e:

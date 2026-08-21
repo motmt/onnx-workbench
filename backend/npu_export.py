@@ -477,7 +477,7 @@ def recover_head_from_end2end(onnx_path: str, work_dir: str) -> tuple:
 
 
 def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
-                      work_dir: str) -> tuple:
+                      work_dir: str, convert_xyxy: bool = False) -> tuple:
     """源头拆分：回溯到 Concat 合并点，在 reg/cls 分支【合并之前】拆分。
 
     参考 yezijinn/onnx_to_int8.tflite 项目设计（DM4 契约）：
@@ -597,9 +597,9 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
             return "reg_cxcywh_nonneg"
 
         inits = []
-        # reg 先统一转 CN，再按需做 xyxy→cxcywh 换算
+        # reg 先统一转 CN，再按需做 xyxy→cxcywh 换算（仅霜雪版 convert_xyxy=True）
         reg_cn_shape = _to_cn(reg, reg_shape, "reg_cn_mid", "src_reg")
-        if _is_xyxy(reg):
+        if convert_xyxy and _is_xyxy(reg):
             reg_final = _xyxy_to_cxcywh("reg_cn_mid", reg_cn_shape[2], nodes, inits)
         else:
             reg_final = "reg_cn_mid"
@@ -718,13 +718,17 @@ def _try_source_split(model, out_vi, c_dim: int, n_dim: int,
     return None
 
 
-def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
+def split_merged_output(onnx_path: str, work_dir: str,
+                        convert_xyxy: bool = False) -> tuple:
     """把 YOLO 单输出 [1,C,N] 拆成 reg[1,4,N] + cls[1,Nc,N] 双输出。
 
     参考 yezijinn/onnx_to_int8.tflite 项目的设计：
     在 ONNX 图层面用 Slice + Identity 源头拆分（禁止用 TFLiteConverter 的 Split，
     因为 Split 会继承父联合范围压扁 cls 量化）。
     拆分后 cls 有独立量化范围，TFLiteConverter 自动算出 scale≈1/256（满足 LOGISTIC 约束）。
+
+    convert_xyxy=True 时（霜雪版），reg 若是 xyxy（左上右下）自动换算 cxcywh；
+    False（QNN 通用版）保持原始坐标语义。
 
     返回 (split_model_path, num_classes)；
     如果模型不是单输出原料型（已是双输出/无法识别通道维），返回 (onnx_path, None)。
@@ -756,7 +760,8 @@ def split_merged_output(onnx_path: str, work_dir: str) -> tuple:
     #    cls 分支末端是 Sigmoid → TFLite 独立量化 scale=1/256（满足 LOGISTIC）；
     #    reg 分支末端是算术算子 → 像素级大 scale 独立校准。
     try:
-        result = _try_source_split(model, out_vi, c_dim, n_dim, work_dir)
+        result = _try_source_split(model, out_vi, c_dim, n_dim, work_dir,
+                                   convert_xyxy=convert_xyxy)
         if result:
             return result
     except Exception:
@@ -887,11 +892,22 @@ def _convert_split_to_opset13(onnx_path: str, work_dir: str) -> str:
 def export_npu_tflite(onnx_path: str, out_dir: str,
                       calibration: str = "random", num_samples: int = 8,
                       images_dir: Optional[str] = None,
-                      original_name: Optional[str] = None) -> dict:
+                      original_name: Optional[str] = None,
+                      target: str = "qnn") -> dict:
     """导出 QNN NPU 专用的全 INT8 TFLite（输入输出均为 INT8）。
 
     前置：必须先通过 check_npu_compliance 检查。
     流程：onnx2tf tf_converter 生成 SavedModel → TFLiteConverter 全整数量化。
+
+    target 选择（两种契约）：
+      - "qnn"（默认）：骁龙 QNN 通用导出 —— 双输出源头拆分 + Split→Slice
+        + 全整数量化。不含任何特定软件（霜雪）的适配，输出保持模型原始
+        坐标语义（reg 可能 xyxy），适合通用 QNN 设备端按自有契约解析。
+      - "snow"：霜雪 APP 专用导出 —— 在 qnn 基础上叠加霜雪契约：
+        * 输入颜色反转（霜雪用 OpenCV BGR 喂图，模型期望 RGB 时自动反转）
+        * reg xyxy→cxcywh 坐标换算（霜雪按中心宽高解析框）
+        * 输出 score_first 顺序交换（霜雪按 OUT[0]=分数 解析）
+        输出文件名加 _snow_ 后缀区分，避免覆盖 qnn 产物。
 
     性能：onnx2tf tf_converter 是主要瓶颈（占 95%），校准样本数影响极小
     （16/8/4 样本耗时差异 <0.03s），默认用 8 样本平衡精度与内存。
@@ -901,6 +917,7 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
                    如 original_name="resnet50.onnx" → 输出 "resnet50_npumotified.tflite"。
                    未提供则用 onnx_path 的文件名。
     """
+    snow = (target == "snow")
     from tflite_export import _check_deps, _size_str
     import onnx2tf
     import tensorflow as tf
@@ -921,10 +938,10 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
             "\n- ".join(check["issues"])
         )
 
-    # 输出文件名：原始模型名（去扩展名）+ _npumotified.tflite
+    # 输出文件名：qnn 版 xxx_npumotified.tflite；snow 版 xxx_snow_npumotified.tflite
     src_name = original_name or os.path.basename(onnx_path)
     base = os.path.splitext(src_name)[0]
-    out_filename = f"{base}_npumotified.tflite"
+    out_filename = f"{base}{'_snow' if snow else ''}_npumotified.tflite"
 
     os.makedirs(out_dir, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="ort_npu_")
@@ -941,21 +958,25 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
                 raise RuntimeError("end2end NMS 检测头还原失败，无法继续导出")
             check["info"]["recover_info"] = rec_info
 
-        # 0.4) 输入颜色顺序检测 + 反转：设备端（libaiassistance.so）用 OpenCV
-        #     BGR 喂图，而 ultralytics 训练的模型输入是 RGB。红蓝通道颠倒会
-        #     导致识别不出。用校准图对比 RGB/BGR 的 cls 分数，模型期望 RGB
-        #     时给输入加 Gather 通道反转（BGR 喂入等效 RGB）。
-        color_order = _detect_color_order(model_for_convert, images_dir)
-        check["info"]["input_color_order"] = color_order
-        if color_order == "RGB":
-            model_for_convert = _reverse_input_channel(model_for_convert, tmp)
-            check["info"]["input_color_reversed"] = True
+        # 0.4) 输入颜色顺序检测 + 反转（仅霜雪版 snow）：
+        #   霜雪设备端（libaiassistance.so）用 OpenCV BGR 喂图，而 ultralytics
+        #   训练的模型输入是 RGB。红蓝通道颠倒会导致识别不出。用校准图对比
+        #   RGB/BGR 的 cls 分数，模型期望 RGB 时给输入加 Gather 通道反转。
+        #   QNN 通用版不做此适配（保留模型原始输入约定）。
+        if snow and images_dir:
+            color_order = _detect_color_order(model_for_convert, images_dir)
+            check["info"]["input_color_order"] = color_order
+            if color_order == "RGB":
+                model_for_convert = _reverse_input_channel(model_for_convert, tmp)
+                check["info"]["input_color_reversed"] = True
 
         # 0.5) 双输出源头拆分：单输出 [1,C,N] → reg[1,4,N] + cls[1,Nc,N]
         #   用 Slice+Identity 在 ONNX 图层面拆分（禁止 TFLiteConverter 的 Split），
         #   让 cls 独立量化（scale≈1/256 满足 LOGISTIC 约束）。
         #   参考 yezijinn/onnx_to_int8.tflite 项目设计。
-        model_for_convert, split_nc = split_merged_output(model_for_convert, tmp)
+        #   convert_xyxy 仅霜雪版开启（reg xyxy→cxcywh 坐标换算）。
+        model_for_convert, split_nc = split_merged_output(
+            model_for_convert, tmp, convert_xyxy=snow)
         if split_nc is not None:
             check["info"]["split_to_dual"] = True
             check["info"]["num_classes"] = split_nc
@@ -1005,9 +1026,11 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
         with open(out_path, "wb") as f:
             f.write(tflite_model)
 
-        # 3.5) 输出顺序校正：设备端按 index 解析（OUT[0]=分数），
-        #       onnx2tf 会把 reg 排 OUT[0]，这里重排成 score_first
-        _reorder_score_first(out_path)
+        # 3.5) 输出顺序校正（仅霜雪版 snow）：霜雪设备端按 index 解析
+        #     （OUT[0]=分数），onnx2tf 会把 reg 排 OUT[0]，这里重排成 score_first。
+        #     QNN 通用版保留 onnx2tf 原始输出顺序（设备端按自身契约解析）。
+        if snow:
+            _reorder_score_first(out_path)
 
         # 3) 验证输入输出确实是 int8
         verify_detail = _verify_int8(out_path)
