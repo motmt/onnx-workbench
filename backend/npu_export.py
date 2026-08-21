@@ -958,12 +958,12 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
                 raise RuntimeError("end2end NMS 检测头还原失败，无法继续导出")
             check["info"]["recover_info"] = rec_info
 
-        # 0.4) 输入颜色顺序检测 + 反转（仅霜雪版 snow）：
-        #   霜雪设备端（libaiassistance.so）用 OpenCV BGR 喂图，而 ultralytics
+        # 0.4) 输入颜色顺序检测 + 反转（qnn/snow 都做）：
+        #   骁龙 QNN 设备端（libaiassistance.so）用 OpenCV BGR 喂图，而 ultralytics
         #   训练的模型输入是 RGB。红蓝通道颠倒会导致识别不出。用校准图对比
-        #   RGB/BGR 的 cls 分数，模型期望 RGB 时给输入加 Gather 通道反转。
-        #   QNN 通用版不做此适配（保留模型原始输入约定）。
-        if snow and images_dir:
+        #   RGB/BGR 的 cls 分数，模型期望 RGB 时给输入加 Slice+Concat 通道反转
+        #   （不用 Gather，QNN HTP 对 Gather 支持有限）。
+        if images_dir:
             color_order = _detect_color_order(model_for_convert, images_dir)
             check["info"]["input_color_order"] = color_order
             if color_order == "RGB":
@@ -974,9 +974,10 @@ def export_npu_tflite(onnx_path: str, out_dir: str,
         #   用 Slice+Identity 在 ONNX 图层面拆分（禁止 TFLiteConverter 的 Split），
         #   让 cls 独立量化（scale≈1/256 满足 LOGISTIC 约束）。
         #   参考 yezijinn/onnx_to_int8.tflite 项目设计。
-        #   convert_xyxy 仅霜雪版开启（reg xyxy→cxcywh 坐标换算）。
+        #   convert_xyxy=True：reg xyxy→cxcywh 坐标换算（骁龙 QNN 设备端按
+        #   中心宽高解析框，实测 qnn 版 xyxy 输出设备端完全没框）。
         model_for_convert, split_nc = split_merged_output(
-            model_for_convert, tmp, convert_xyxy=snow)
+            model_for_convert, tmp, convert_xyxy=True)
         if split_nc is not None:
             check["info"]["split_to_dual"] = True
             check["info"]["num_classes"] = split_nc
